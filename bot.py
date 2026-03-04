@@ -445,11 +445,20 @@ def build_reply_kb(is_admin: bool) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True, is_persistent=True)
 
 def normalize_button(text: str) -> str:
+    """
+    FIX: Reply-кнопки могут приходить с разными emoji/variation selectors.
+    Нормализуем надежно: выкидываем все, кроме букв/цифр/пробелов, и матчим по ключевым словам.
+    """
     if not text:
         return ""
-    s = " ".join(text.strip().lower().split())
-    s = s.replace("🏠", "").replace("📅", "").replace("💰", "").replace("👩‍🎨", "").replace("📍", "").replace("📋", "").replace("⭐", "").replace("🛠", "")
-    s = " ".join(s.split())
+
+    # lower + trim
+    raw = " ".join(text.strip().lower().split())
+
+    # оставляем только буквы/цифры/пробелы (emoji и спецсимволы уйдут)
+    cleaned = re.sub(r"[^0-9a-zа-яё\s]", " ", raw, flags=re.IGNORECASE)
+    cleaned = " ".join(cleaned.split())
+
     aliases = {
         "записаться": "book",
         "запись": "book",
@@ -468,12 +477,16 @@ def normalize_button(text: str) -> str:
         "главное меню": "menu",
         "домой": "menu",
     }
-    if s in aliases:
-        return aliases[s]
-    raw = " ".join(text.strip().lower().split())
+
+    # точное совпадение
+    if cleaned in aliases:
+        return aliases[cleaned]
+
+    # совпадение по окончанию (на случай “📋 Мои записи” и т.п.)
     for k, v in aliases.items():
-        if raw.endswith(k):
+        if cleaned.endswith(k):
             return v
+
     return ""
 
 # -------------------------
@@ -1039,8 +1052,10 @@ async def menu_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("📅 Записи на 7 дней", callback_data="adm:list:7")],
-        [InlineKeyboardButton("🟡 Только pending", callback_data="adm:list:pending")],
-        [InlineKeyboardButton("✅ Только confirmed", callback_data="adm:list:confirmed")],
+        [InlineKeyboardButton("📅 Записи на 14 дней", callback_data="adm:list:14")],
+        [InlineKeyboardButton("📋 Все записи", callback_data="adm:list:all")],
+        [InlineKeyboardButton("🟡 Ожидают подтверждения", callback_data="adm:list:pending")],
+        [InlineKeyboardButton("✅ Подтвержденные", callback_data="adm:list:confirmed")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="nav:menu")],
     ])
     await safe_send(update, context, text, reply_markup=kb)
@@ -1784,70 +1799,89 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     # ADMIN CONFIRM/CANCEL/MSG
-    if data.startswith("admin:"):
+    if data.startswith("adm:list:"):
         if not is_admin_user(uid):
             await safe_edit_or_send(update, context, query=query, text="⛔ Доступ только для администратора.", reply_markup=None)
             return
 
-        parts = data.split(":")
-        if len(parts) < 3:
-            await safe_edit_or_send(update, context, query=query, text="⚠️ Некорректная команда админа.", reply_markup=None)
-            return
-        action = parts[1]
+        token = data.split(":", 2)[2]
+        now_ = now_tz()
+        conn = db_connect()
         try:
-            booking_id = int(parts[2])
-        except Exception:
-            await safe_edit_or_send(update, context, query=query, text="⚠️ Некорректный ID записи.", reply_markup=None)
+            cur = conn.cursor()
+            rows = []
+            title = "📋 Записи"
+
+            if token in ("7", "14"):
+                days = int(token)
+                end_date = (now_.date() + timedelta(days=days)).isoformat()
+                cur.execute("""
+                    SELECT b.*, u.name AS user_name, u.phone AS user_phone
+                    FROM bookings b
+                    JOIN users u ON u.user_id = b.user_id
+                    WHERE b.status IN ('pending','confirmed')
+                      AND b.date >= ?
+                      AND b.date <= ?
+                    ORDER BY b.date ASC, b.time ASC
+                    LIMIT 80
+                """, (now_.date().isoformat(), end_date))
+                rows = cur.fetchall()
+                title = f"📅 Записи на {days} дней"
+
+            elif token == "all":
+                cur.execute("""
+                    SELECT b.*, u.name AS user_name, u.phone AS user_phone
+                    FROM bookings b
+                    JOIN users u ON u.user_id = b.user_id
+                    WHERE b.status IN ('pending','confirmed','cancelled')
+                    ORDER BY b.date ASC, b.time ASC
+                    LIMIT 100
+                """)
+                rows = cur.fetchall()
+                title = "📋 Все записи"
+
+            elif token in ("pending", "confirmed"):
+                cur.execute("""
+                    SELECT b.*, u.name AS user_name, u.phone AS user_phone
+                    FROM bookings b
+                    JOIN users u ON u.user_id = b.user_id
+                    WHERE b.status = ?
+                    ORDER BY b.date ASC, b.time ASC
+                    LIMIT 80
+                """, (token,))
+                rows = cur.fetchall()
+                title = "🟡 Ожидают подтверждения" if token == "pending" else "✅ Подтвержденные"
+
+            else:
+                rows = []
+                title = "📋 Записи"
+        finally:
+            conn.close()
+
+        if not rows:
+            await safe_edit_or_send(
+                update, context, query=query,
+                text=f"<b>{html.escape(title)}</b>\n\nПока пусто.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="nav:menu")]])
+            )
             return
 
-        row = db_get_booking(booking_id)
-        if not row:
-            await safe_edit_or_send(update, context, query=query, text="⚠️ Запись не найдена.", reply_markup=None)
-            return
+        lines = [f"<b>{html.escape(title)}</b>\n"]
+        for r in rows[:30]:
+            status = r["status"]
+            status_emoji = "🟡" if status == "pending" else ("✅" if status == "confirmed" else "❌")
+            lines.append(
+                f"{status_emoji} <b>#{r['id']}</b> — {html.escape(SERVICE_LABEL_BY_KEY.get(r['service'], r['service']))}\n"
+                f"📅 {html.escape(fmt_date_ru(r['date']))}  🕒 {html.escape(r['time'])}\n"
+                f"👤 {html.escape(r['user_name'])}  📞 {html.escape(r['user_phone'])}\n"
+            )
 
-        if action == "confirm":
-            db_update_booking_status(booking_id, "confirmed")
-            try:
-                await context.bot.send_message(
-                    chat_id=int(row["user_id"]),
-                    text=(
-                        "✅ <b>Запись подтверждена!</b>\n\n"
-                        f"🆔 <b>#{booking_id}</b>\n"
-                        f"💎 Услуга: <b>{html.escape(SERVICE_LABEL_BY_KEY.get(row['service'], row['service']))}</b>\n"
-                        f"📅 Дата/время: <b>{html.escape(fmt_datetime_ru(row['date'], row['time']))}</b>\n\n"
-                        f"📍 Адрес: <b>{html.escape(ADDRESS_TEXT)}</b>\n"
-                        f"🗺 Карта: {html.escape(MAPS_URL)}\n\n"
-                        "До встречи! 💛"
-                    ),
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                )
-            except TelegramError:
-                pass
-
-            await safe_edit_or_send(update, context, query=query, text=f"✅ Подтверждено: <b>#{booking_id}</b>", reply_markup=admin_booking_controls(booking_id))
-            return
-
-        if action == "cancel":
-            db_update_booking_status(booking_id, "cancelled")
-            try:
-                await context.bot.send_message(
-                    chat_id=int(row["user_id"]),
-                    text=(
-                        "❌ <b>Запись отменена</b>\n\n"
-                        f"🆔 <b>#{booking_id}</b>\n"
-                        f"💎 Услуга: <b>{html.escape(SERVICE_LABEL_BY_KEY.get(row['service'], row['service']))}</b>\n"
-                        f"📅 Дата/время: <b>{html.escape(fmt_datetime_ru(row['date'], row['time']))}</b>\n\n"
-                        "Если хотите — выберите другое время через 📅 Записаться."
-                    ),
-                    parse_mode=ParseMode.HTML,
-                )
-            except TelegramError:
-                pass
-
-            await safe_edit_or_send(update, context, query=query, text=f"❌ Отменено: <b>#{booking_id}</b>", reply_markup=admin_booking_controls(booking_id))
-            return
-
+        await safe_edit_or_send(
+            update, context, query=query,
+            text="\n".join(lines),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="nav:menu")]])
+        )
+        return
         if action == "msg":
             set_mode(context, "admin_msg")
             context.user_data["admin_msg_payload"] = {"booking_id": booking_id, "user_id": int(row["user_id"])}
@@ -1951,3 +1985,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
