@@ -1,2 +1,4 @@
-python-telegram-bot[job-queue]>=21.0
-tzdata>=2024.1
+python-telegram-bot[job-queue]>=21.10
+pytz
+apscheduler
+
