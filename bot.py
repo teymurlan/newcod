@@ -148,18 +148,28 @@ def db_save_review(user_id: int, text: str):
     conn.commit()
     conn.close()
 
-def db_get_latest_reviews(limit: int = 5):
+def db_has_previous_bookings(user_id: int) -> bool:
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("""
-        SELECT r.text, u.name, r.created_at 
-        FROM reviews r 
-        JOIN users u ON r.user_id = u.user_id 
-        ORDER BY r.created_at DESC LIMIT ?
-    """, (limit,))
-    reviews = cursor.fetchall()
+    cursor.execute("SELECT COUNT(*) FROM bookings WHERE user_id = ? AND status != 'cancelled'", (user_id,))
+    count = cursor.fetchone()[0]
     conn.close()
-    return reviews
+    return count > 0
+
+def db_get_all_upcoming_bookings():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    today = date.today().isoformat()
+    cursor.execute("""
+        SELECT b.*, u.name, u.phone 
+        FROM bookings b
+        JOIN users u ON b.user_id = u.user_id
+        WHERE b.date >= ? AND b.status != 'cancelled'
+        ORDER BY b.date ASC, b.time ASC
+    """, (today,))
+    bookings = cursor.fetchall()
+    conn.close()
+    return bookings
 
 # --- HELPERS ---
 
@@ -441,7 +451,32 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(update, context, text, reply_markup=kb)
         return
     elif norm == "admin" and user_id == ADMIN_ID:
-        await safe_send(update, context, "🛠 Админ-панель. Здесь будут приходить уведомления о новых записях.")
+        bookings = db_get_all_upcoming_bookings()
+        if not bookings:
+            await safe_send(update, context, "🛠 <b>Админ-панель</b>\n\nАктивных записей на ближайшее время нет.")
+        else:
+            await safe_send(update, context, f"🛠 <b>Админ-панель</b>\nНайдено записей: {len(bookings)}")
+            for b in bookings:
+                # b: (id, user_id, service, date, time, comment, status, created_at, reminded, name, phone)
+                status_emoji = "⏳" if b[6] == "pending" else "✅"
+                is_first = not db_has_previous_bookings(b[1]) # This check might be tricky since we just added one, but status is pending
+                # Better: check if this is the ONLY booking for this user
+                
+                text = (
+                    f"{status_emoji} <b>Запись #{b[0]}</b>\n"
+                    f"👤 Клиент: {b[9]} ({b[10]})\n"
+                    f"💅 Услуга: {b[2]}\n"
+                    f"📅 Дата: {b[3]} в {b[4]}\n"
+                    f"💬: {b[5] if b[5] else 'нет'}\n"
+                )
+                
+                kb = []
+                if b[6] == "pending":
+                    kb.append([InlineKeyboardButton("✅ Подтвердить", callback_data=f"adm_conf_{b[0]}")])
+                kb.append([InlineKeyboardButton("❌ Отменить", callback_data=f"adm_rejc_{b[0]}")])
+                kb.append([InlineKeyboardButton("💬 Написать", callback_data=f"adm_msg_{b[1]} text")])
+                
+                await safe_send(update, context, text, reply_markup=InlineKeyboardMarkup(kb))
         return
     elif norm == "menu":
         context.user_data["mode"] = None
@@ -489,7 +524,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_booking_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = context.user_data
-    user = db_get_user(update.effective_user.id)
+    user_id = update.effective_user.id
+    user = db_get_user(user_id)
+    
+    is_first = not db_has_previous_bookings(user_id)
     
     summary = (
         "<b>🏁 Подтверждение записи:</b>\n\n"
@@ -499,8 +537,12 @@ async def show_booking_summary(update: Update, context: ContextTypes.DEFAULT_TYP
         f"👤 Имя: {user[1]}\n"
         f"📞 Тел: {user[2]}\n"
     )
+    
+    if is_first:
+        summary += "\n🎁 <b>Акция:</b> Ваша первая запись через бота! Скидка <b>7%</b> применена. ✨\n"
+        
     if data.get("b_comment"):
-        summary += f"💬 Комментарий: {data.get('b_comment')}\n"
+        summary += f"\n💬 Комментарий: {data.get('b_comment')}\n"
     
     await safe_send(update, context, summary, reply_markup=get_confirm_keyboard())
 
@@ -556,6 +598,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(update, context, "Введите ваш комментарий к записи (или любую reply-кнопку для отмены):")
         
     elif data == "confirm_booking":
+        user_id = update.effective_user.id
+        is_first = not db_has_previous_bookings(user_id)
+        
         b_id = db_save_booking(
             user_id, 
             context.user_data.get("b_service"),
@@ -563,11 +608,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.get("b_time"),
             context.user_data.get("b_comment", "")
         )
-        await safe_send(update, context, "✅ Запись создана! Ожидайте подтверждения мастера.")
+        
+        msg = "✅ Запись создана! Ожидайте подтверждения мастера."
+        if is_first:
+            msg += "\n\n🎁 Скидка 7% на первый визит зафиксирована!"
+        await safe_send(update, context, msg)
         
         user = db_get_user(user_id)
         admin_text = (
-            "<b>🆕 Новая запись!</b>\n\n"
+            f"<b>🆕 Новая запись!</b>\n"
+            f"{'🎁 АКЦИЯ: ПЕРВЫЙ ВИЗИТ (-7%)' if is_first else ''}\n\n"
             f"👤 Клиент: {user[1]} ({user[2]})\n"
             f"💅 Услуга: {context.user_data.get('b_service')}\n"
             f"📅 Дата: {context.user_data.get('b_date')}\n"
