@@ -16,6 +16,7 @@ from telegram import (
     InlineKeyboardMarkup,
     ReplyKeyboardRemove,
     Message,
+    InputMediaPhoto,
 )
 from telegram.ext import (
     Application,
@@ -187,7 +188,7 @@ def db_has_previous_bookings(user_id: int) -> bool:
     conn.close()
     return count > 0
 
-def db_save_gallery_photo(file_id: int):
+def db_save_gallery_photo(file_id: str):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     now = datetime.now(MOSCOW_TZ).isoformat()
@@ -325,7 +326,7 @@ async def send_gallery(update: Update, context: ContextTypes.DEFAULT_TYPE, page:
     try:
         if update.callback_query and update.callback_query.message.photo:
             await update.callback_query.edit_message_media(
-                media=telegram.InputMediaPhoto(url_or_id, caption="Мои работы:"),
+                media=InputMediaPhoto(url_or_id, caption="Мои работы:"),
                 reply_markup=InlineKeyboardMarkup(kb)
             )
         else:
@@ -476,12 +477,16 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     if context.user_data.get("mode") != "admin_add_photo": return
     
-    photo = update.message.photo[-1] # Best quality
-    db_save_gallery_photo(photo.file_id)
-    context.user_data["mode"] = None
-    
-    await safe_send(update, context, "✅ Фото успешно добавлено в галерею!")
-    await show_gallery_admin(update, context)
+    try:
+        photo = update.message.photo[-1] # Best quality
+        db_save_gallery_photo(photo.file_id)
+        context.user_data["mode"] = None
+        
+        await safe_send(update, context, "✅ Фото успешно добавлено в галерею!")
+        await show_gallery_admin(update, context)
+    except Exception as e:
+        logger.error(f"Error saving photo: {e}")
+        await safe_send(update, context, "❌ Ошибка при сохранении фото. Попробуйте еще раз.")
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
