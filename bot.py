@@ -159,14 +159,14 @@ def db_has_previous_bookings(user_id: int) -> bool:
 def db_get_all_upcoming_bookings():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    today = date.today().isoformat()
+    # Берем записи за сегодня и будущее, исключая отмененные
     cursor.execute("""
         SELECT b.*, u.name, u.phone 
         FROM bookings b
-        JOIN users u ON b.user_id = u.user_id
-        WHERE b.date >= ? AND b.status != 'cancelled'
+        LEFT JOIN users u ON b.user_id = u.user_id
+        WHERE b.date >= date('now', 'localtime') AND b.status != 'cancelled'
         ORDER BY b.date ASC, b.time ASC
-    """, (today,))
+    """)
     bookings = cursor.fetchall()
     conn.close()
     return bookings
@@ -174,8 +174,8 @@ def db_get_all_upcoming_bookings():
 # --- HELPERS ---
 
 def normalize_button(text: str) -> str:
-    if not text: return ""
-    t = text.lower()
+    if not text: return None
+    t = text.lower().strip()
     
     if "записаться" in t: return "book"
     if "цены" in t: return "prices"
@@ -187,7 +187,7 @@ def normalize_button(text: str) -> str:
     if "меню" in t: return "menu"
     if "назад" in t: return "back"
     
-    return t
+    return None
 
 async def track_message(context: ContextTypes.DEFAULT_TYPE, message_id: int):
     if not AUTO_CLEAN: return
@@ -371,125 +371,123 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await track_message(context, update.message.message_id)
     
-    # 1. Check Reply Buttons First
-    if norm == "book":
-        user = db_get_user(user_id)
-        if not user:
-            await safe_send(update, context, "Для записи нужно сначала представиться. Как мне к вам обращаться?")
-            context.user_data["mode"] = "await_name"
-            return
+    # 1. Если нажата кнопка меню - ВСЕГДА сбрасываем режим и выполняем команду
+    if norm:
         context.user_data["mode"] = None
-        await safe_send(update, context, "Выберите услугу:", reply_markup=get_services_keyboard())
-        return
-    elif norm == "prices":
-        prices_text = (
-            "<b>💰 Наши цены:</b>\n\n"
-            "✨ Маникюр без покрытия — 1300 ₽\n"
-            "💅 Маникюр с покрытием — 2500 ₽\n"
-            "🎨 Маникюр с покрытием + дизайн — 3000 ₽\n\n"
-            "🦶 Педикюр без покрытия — 2000 ₽\n"
-            "💖 Педикюр + покрытие — 2800 ₽\n"
-            "👣 Педикюр пальчики — 1800 ₽\n"
-            "🦶 Обработка стоп — 1500 ₽\n\n"
-            "✨ Наращивание ногтей — от 3500 ₽\n"
-            "🔧 Коррекция ногтей — от 2800 ₽\n"
-            "🎨 Дизайн — от 50 ₽ / ноготь\n\n"
-            "<i>Нажмите кнопку ниже для записи</i>"
-        )
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📅 Записаться", callback_data="book_start")]])
-        await safe_send(update, context, prices_text, reply_markup=kb)
-        return
-    elif norm == "about":
-        about_text = (
-            "<b>👩🎨 О мастере:</b>\n\n"
-            "Меня зовут Ирина, я сертифицированный мастер с опытом более 7 лет.\n"
-            "✅ Стерильность по СанПиН (3 этапа)\n"
-            "✅ Качественные материалы\n"
-            "✅ Уютная атмосфера и вкусный кофе\n\n"
-            "Буду рада видеть вас у себя!"
-        )
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📷 Фотогалерея", callback_data="show_gallery")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="to_menu")]
-        ])
-        await safe_send(update, context, about_text, reply_markup=kb)
-        return
-    elif norm == "location":
-        loc_text = (
-            "<b>📍 Как нас найти:</b>\n\n"
-            f"🏠 Адрес: {ADDRESS_TEXT}\n"
-            "Ориентир: 10 этаж, направо от лифта.\n\n"
-            f"🔗 <a href='{MAPS_URL}'>Открыть на картах</a>"
-        )
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="to_menu")]])
-        await safe_send(update, context, loc_text, reply_markup=kb)
-        return
-    elif norm == "my_bookings":
-        bookings = db_get_user_bookings(user_id)
-        if not bookings:
-            await safe_send(update, context, "У вас пока нет активных записей.")
-        else:
-            for b in bookings:
-                status_emoji = "⏳" if b[6] == "pending" else "✅"
-                b_text = f"<b>📋 Запись:</b>\n\n{status_emoji} {b[2]}\n📅 {b[3]} в {b[4]}\n"
-                kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить запись", callback_data=f"cancel_b_{b[0]}")]])
-                await safe_send(update, context, b_text, reply_markup=kb)
-        return
-    elif norm == "reviews":
-        reviews = db_get_latest_reviews()
-        text = "<b>⭐ Последние отзывы:</b>\n\n"
-        if not reviews:
-            text += "Отзывов пока нет. Будьте первыми!"
-        else:
-            for r in reviews:
-                text += f"👤 {r[1]}:\n«{r[0]}»\n\n"
         
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✍️ Оставить отзыв", callback_data="add_review")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="to_menu")]
-        ])
-        await safe_send(update, context, text, reply_markup=kb)
-        return
-    elif norm == "admin" and user_id == ADMIN_ID:
-        bookings = db_get_all_upcoming_bookings()
-        if not bookings:
-            await safe_send(update, context, "🛠 <b>Админ-панель</b>\n\nАктивных записей на ближайшее время нет.")
-        else:
-            await safe_send(update, context, f"🛠 <b>Админ-панель</b>\nНайдено записей: {len(bookings)}")
-            for b in bookings:
-                # b: (id, user_id, service, date, time, comment, status, created_at, reminded, name, phone)
-                status_emoji = "⏳" if b[6] == "pending" else "✅"
-                is_first = not db_has_previous_bookings(b[1]) # This check might be tricky since we just added one, but status is pending
-                # Better: check if this is the ONLY booking for this user
-                
-                text = (
-                    f"{status_emoji} <b>Запись #{b[0]}</b>\n"
-                    f"👤 Клиент: {b[9]} ({b[10]})\n"
-                    f"💅 Услуга: {b[2]}\n"
-                    f"📅 Дата: {b[3]} в {b[4]}\n"
-                    f"💬: {b[5] if b[5] else 'нет'}\n"
-                )
-                
-                kb = []
-                if b[6] == "pending":
-                    kb.append([InlineKeyboardButton("✅ Подтвердить", callback_data=f"adm_conf_{b[0]}")])
-                kb.append([InlineKeyboardButton("❌ Отменить", callback_data=f"adm_rejc_{b[0]}")])
-                kb.append([InlineKeyboardButton("💬 Написать", callback_data=f"adm_msg_{b[1]} text")])
-                
-                await safe_send(update, context, text, reply_markup=InlineKeyboardMarkup(kb))
-        return
-    elif norm == "menu":
-        context.user_data["mode"] = None
-        await safe_send(update, context, "Главное меню:", reply_markup=get_main_menu_keyboard(user_id))
-        return
+        if norm == "book":
+            user = db_get_user(user_id)
+            if not user:
+                await safe_send(update, context, "Для записи нужно сначала представиться. Как мне к вам обращаться?")
+                context.user_data["mode"] = "await_name"
+                return
+            await safe_send(update, context, "Выберите услугу:", reply_markup=get_services_keyboard())
+            return
+        elif norm == "prices":
+            prices_text = (
+                "<b>💰 Наши цены:</b>\n\n"
+                "✨ Маникюр без покрытия — 1300 ₽\n"
+                "💅 Маникюр с покрытием — 2500 ₽\n"
+                "🎨 Маникюр с покрытием + дизайн — 3000 ₽\n\n"
+                "🦶 Педикюр без покрытия — 2000 ₽\n"
+                "💖 Педикюр + покрытие — 2800 ₽\n"
+                "👣 Педикюр пальчики — 1800 ₽\n"
+                "🦶 Обработка стоп — 1500 ₽\n\n"
+                "✨ Наращивание ногтей — от 3500 ₽\n"
+                "🔧 Коррекция ногтей — от 2800 ₽\n"
+                "🎨 Дизайн — от 50 ₽ / ноготь\n\n"
+                "<i>Нажмите кнопку ниже для записи</i>"
+            )
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("📅 Записаться", callback_data="book_start")]])
+            await safe_send(update, context, prices_text, reply_markup=kb)
+            return
+        elif norm == "about":
+            about_text = (
+                "<b>👩🎨 О мастере:</b>\n\n"
+                "Меня зовут Ирина, я сертифицированный мастер с опытом более 7 лет.\n"
+                "✅ Стерильность по СанПиН (3 этапа)\n"
+                "✅ Качественные материалы\n"
+                "✅ Уютная атмосфера и вкусный кофе\n\n"
+                "Буду рада видеть вас у себя!"
+            )
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📷 Фотогалерея", callback_data="show_gallery")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="to_menu")]
+            ])
+            await safe_send(update, context, about_text, reply_markup=kb)
+            return
+        elif norm == "location":
+            loc_text = (
+                "<b>📍 Как нас найти:</b>\n\n"
+                f"🏠 Адрес: {ADDRESS_TEXT}\n"
+                "Ориентир: 10 этаж, направо от лифта.\n\n"
+                f"🔗 <a href='{MAPS_URL}'>Открыть на картах</a>"
+            )
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="to_menu")]])
+            await safe_send(update, context, loc_text, reply_markup=kb)
+            return
+        elif norm == "my_bookings":
+            bookings = db_get_user_bookings(user_id)
+            if not bookings:
+                await safe_send(update, context, "У вас пока нет активных записей.")
+            else:
+                for b in bookings:
+                    status_emoji = "⏳" if b[6] == "pending" else "✅"
+                    b_text = f"<b>📋 Запись:</b>\n\n{status_emoji} {b[2]}\n📅 {b[3]} в {b[4]}\n"
+                    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить запись", callback_data=f"cancel_b_{b[0]}")]])
+                    await safe_send(update, context, b_text, reply_markup=kb)
+            return
+        elif norm == "reviews":
+            reviews = db_get_latest_reviews()
+            text = "<b>⭐ Последние отзывы:</b>\n\n"
+            if not reviews:
+                text += "Отзывов пока нет. Будьте первыми!"
+            else:
+                for r in reviews:
+                    text += f"👤 {r[1]}:\n«{r[0]}»\n\n"
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✍️ Оставить отзыв", callback_data="add_review")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="to_menu")]
+            ])
+            await safe_send(update, context, text, reply_markup=kb)
+            return
+        elif norm == "admin" and user_id == ADMIN_ID:
+            bookings = db_get_all_upcoming_bookings()
+            if not bookings:
+                await safe_send(update, context, "🛠 <b>Админ-панель</b>\n\nАктивных записей на ближайшее время нет.")
+            else:
+                await safe_send(update, context, f"🛠 <b>Админ-панель</b>\nНайдено записей: {len(bookings)}")
+                for b in bookings:
+                    status_emoji = "⏳" if b[6] == "pending" else "✅"
+                    text = (
+                        f"{status_emoji} <b>Запись #{b[0]}</b>\n"
+                        f"👤 Клиент: {b[9] if b[9] else 'Неизвестно'} ({b[10] if b[10] else 'нет номера'})\n"
+                        f"💅 Услуга: {b[2]}\n"
+                        f"📅 Дата: {b[3]} в {b[4]}\n"
+                        f"💬: {b[5] if b[5] else 'нет'}\n"
+                    )
+                    kb = []
+                    if b[6] == "pending":
+                        kb.append([InlineKeyboardButton("✅ Подтвердить", callback_data=f"adm_conf_{b[0]}")])
+                    kb.append([InlineKeyboardButton("❌ Отменить", callback_data=f"adm_rejc_{b[0]}")])
+                    kb.append([InlineKeyboardButton("💬 Написать", callback_data=f"adm_msg_{b[1]} text")])
+                    await safe_send(update, context, text, reply_markup=InlineKeyboardMarkup(kb))
+            return
+        elif norm == "menu":
+            await safe_send(update, context, "Главное меню:", reply_markup=get_main_menu_keyboard(user_id))
+            return
 
     # 2. Handle Input Modes
     mode = context.user_data.get("mode")
     if mode == "await_name":
+        if len(text) > 40:
+            await safe_send(update, context, "Слишком длинное имя. Попробуйте еще раз:")
+            return
         context.user_data["reg_name"] = text
         context.user_data["mode"] = "await_phone"
         kb = ReplyKeyboardMarkup([[KeyboardButton("📲 Отправить номер", request_contact=True)]], resize_keyboard=True)
-        await safe_send(update, context, "Отлично! Теперь введите ваш номер телефона или нажмите кнопку ниже:", reply_markup=kb)
+        await safe_send(update, context, f"Приятно познакомиться, {text}! Теперь введите ваш номер телефона или нажмите кнопку ниже:", reply_markup=kb)
+        return
     
     elif mode == "await_phone":
         clean_phone = re.sub(r'[^\d+]', '', text)
