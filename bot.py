@@ -180,6 +180,19 @@ def db_has_previous_bookings(user_id: int) -> bool:
     conn.close()
     return count > 0
 
+def db_get_latest_reviews(limit: int = 5):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT r.text, u.name 
+        FROM reviews r
+        JOIN users u ON r.user_id = u.user_id
+        ORDER BY r.created_at DESC LIMIT ?
+    """, (limit,))
+    reviews = cursor.fetchall()
+    conn.close()
+    return reviews
+
 def db_get_filtered_bookings(days: int, past: bool = False):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -194,7 +207,7 @@ def db_get_filtered_bookings(days: int, past: bool = False):
             ORDER BY b.date DESC, b.time DESC
         """, (f"-{days} days",))
     else:
-        # Будущие на X дней
+        # Будущие на X дней (9999 для "Все")
         cursor.execute("""
             SELECT b.*, u.name, u.phone 
             FROM bookings b
@@ -210,11 +223,14 @@ def db_get_filtered_bookings(days: int, past: bool = False):
 
 # --- HELPERS ---
 
-def format_date_str(date_str: str) -> str:
+def format_dt(date_str: str, time_str: str = "") -> str:
     try:
-        return datetime.strptime(date_str, "%Y-%m-%d").strftime("%d.%m.%Y")
+        d = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d.%m.%Y")
+        if time_str:
+            return f"{d} {time_str}"
+        return d
     except:
-        return date_str
+        return f"{date_str} {time_str}".strip()
 
 def normalize_button(text: str) -> str:
     if not text: return None
@@ -298,8 +314,7 @@ def get_main_menu_keyboard(user_id: int):
         [KeyboardButton("📅 Записаться"), KeyboardButton("💰 Цены")],
         [KeyboardButton("👩🎨 Обо мне"), KeyboardButton("📍 Как нас найти")],
         [KeyboardButton("📋 Мои записи"), KeyboardButton("⭐ Отзывы")],
-        [KeyboardButton("❓ Вопросы и ответы")],
-        [KeyboardButton("🏠 Меню")]
+        [KeyboardButton("❓ Вопросы и ответы")]
     ]
     if user_id == ADMIN_ID:
         buttons.append([KeyboardButton("🛠 Админ панель")])
@@ -493,7 +508,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 for b in bookings:
                     status_emoji = "⏳" if b[6] == "pending" else "✅"
-                    b_text = f"<b>📋 Запись:</b>\n\n{status_emoji} {b[2]}\n📅 {b[3]} в {b[4]}\n"
+                    f_dt = format_dt(b[3], b[4])
+                    b_text = f"<b>📋 Запись:</b>\n\n{status_emoji} {b[2]}\n📅 {f_dt}\n"
                     kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить запись", callback_data=f"cancel_b_{b[0]}")]])
                     await safe_send(update, context, b_text, reply_markup=kb)
             return
@@ -574,7 +590,7 @@ async def show_admin_filters(update: Update, context: ContextTypes.DEFAULT_TYPE)
     kb = [
         [InlineKeyboardButton("📅 На 7 дней", callback_data="adm_view_7"),
          InlineKeyboardButton("📅 На 14 дней", callback_data="adm_view_14")],
-        [InlineKeyboardButton("📅 На 30 дней", callback_data="adm_view_30")],
+        [InlineKeyboardButton("📅 Все записи", callback_data="adm_view_9999")],
         [InlineKeyboardButton("🕒 Прошедшие (7 дней)", callback_data="adm_view_past_7")],
         [InlineKeyboardButton("🏠 В меню", callback_data="to_menu")]
     ]
@@ -586,13 +602,12 @@ async def show_booking_summary(update: Update, context: ContextTypes.DEFAULT_TYP
     user = db_get_user(user_id)
     
     is_first = not db_has_previous_bookings(user_id)
-    f_date = format_date_str(data.get('b_date'))
+    f_dt = format_dt(data.get('b_date'), data.get('b_time'))
     
     summary = (
         "<b>🏁 Подтверждение записи:</b>\n\n"
         f"💅 Услуга: {data.get('b_service')}\n"
-        f"📅 Дата: {f_date}\n"
-        f"⏰ Время: {data.get('b_time')}\n"
+        f"📅 Дата и время: {f_dt}\n"
         f"👤 Имя: {user[1]}\n"
         f"📞 Тел: {user[2]}\n"
     )
@@ -707,15 +722,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not bookings:
             await safe_send(update, context, f"🛠 <b>Админ-панель</b>\n\n{title} записей на {days} дн. не найдено.")
         else:
-            await safe_send(update, context, f"🛠 <b>Админ-панель</b>\n{title} записей ({days} дн.): {len(bookings)}")
+            await safe_send(update, context, f"🛠 <b>Админ-панель</b>\n{title} записей ({days if days < 9000 else 'все'} дн.): {len(bookings)}")
             for b in bookings:
                 status_emoji = "⏳" if b[6] == "pending" else "✅"
-                f_date = format_date_str(b[3])
+                f_dt = format_dt(b[3], b[4])
                 text = (
                     f"{status_emoji} <b>Запись #{b[0]}</b>\n"
                     f"👤 Клиент: {b[9] if b[9] else 'Неизвестно'} ({b[10] if b[10] else 'нет номера'})\n"
                     f"💅 Услуга: {b[2]}\n"
-                    f"📅 Дата: {f_date} в {b[4]}\n"
+                    f"📅 Дата: {f_dt}\n"
                     f"💬: {b[5] if b[5] else 'нет'}\n"
                 )
                 kb = []
@@ -730,11 +745,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         b_id = int(data.split("_")[2])
         db_update_booking_status(b_id, "confirmed")
         booking = db_get_booking(b_id)
-        f_date = format_date_str(booking[3])
+        f_dt = format_dt(booking[3], booking[4])
         await query.edit_message_text(query.message.text + "\n\n✅ ПОДТВЕРЖДЕНО")
         
         conf_msg = (
-            f"✅ Ваша запись на <b>{f_date} {booking[4]}</b> подтверждена мастером! Ждем вас.\n\n"
+            f"✅ Ваша запись на <b>{f_dt}</b> подтверждена мастером! Ждем вас.\n\n"
             f"📍 <b>Как нас найти:</b>\n{ADDRESS_TEXT}\n"
             f"🔗 <a href='{MAPS_URL}'>Открыть на картах</a>"
         )
@@ -744,9 +759,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         b_id = int(data.split("_")[2])
         db_update_booking_status(b_id, "cancelled")
         booking = db_get_booking(b_id)
-        f_date = format_date_str(booking[3])
+        f_dt = format_dt(booking[3], booking[4])
         await query.edit_message_text(query.message.text + "\n\n❌ ОТКЛОНЕНО")
-        await context.bot.send_message(chat_id=booking[1], text=f"❌ К сожалению, мастер не может принять вас <b>{f_date} {booking[4]}</b>. Попробуйте выбрать другое время.", parse_mode="HTML")
+        await context.bot.send_message(chat_id=booking[1], text=f"❌ К сожалению, мастер не может принять вас <b>{f_dt}</b>. Попробуйте выбрать другое время.", parse_mode="HTML")
 
     elif data.startswith("adm_msg_"):
         target_id = int(data.split("_")[2])
@@ -760,7 +775,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_update_booking_status(b_id, "cancelled")
         await query.edit_message_text("❌ Запись отменена.")
         user = db_get_user(user_id)
-        await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Клиент {user[1]} отменил запись на {booking[3]} {booking[4]}.")
+        f_dt = format_dt(booking[3], booking[4])
+        await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Клиент {user[1]} отменил запись на {f_dt}.")
 
     elif data == "add_review":
         context.user_data["mode"] = "await_review"
