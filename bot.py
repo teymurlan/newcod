@@ -211,6 +211,14 @@ def db_delete_last_photo():
     conn.commit()
     conn.close()
 
+def db_get_booked_times(date_str: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT time FROM bookings WHERE date = ? AND status != 'cancelled'", (date_str,))
+    times = [r[0] for r in cursor.fetchall()]
+    conn.close()
+    return times
+
 def db_get_latest_reviews(limit: int = 5):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -407,22 +415,27 @@ def get_calendar_keyboard(year: int, month: int):
 def get_time_keyboard(b_date_str: str):
     now = datetime.now(MOSCOW_TZ)
     b_date = date.fromisoformat(b_date_str)
+    booked_times = db_get_booked_times(b_date_str)
     
     keyboard = []
     start_h = 8
     end_h = 23
     
-    times = []
+    times_data = []
     for h in range(start_h, end_h):
         for m in [0, 30]:
             t_str = f"{h:02d}:{m:02d}"
             if b_date == now.date():
                 if h < now.hour or (h == now.hour and m <= now.minute):
                     continue
-            times.append(t_str)
             
-    for i in range(0, len(times), 4):
-        row = [InlineKeyboardButton(t, callback_data=f"time_{t}") for t in times[i:i+4]]
+            if t_str in booked_times:
+                times_data.append((f"❌ {t_str}", "noop_booked"))
+            else:
+                times_data.append((t_str, f"time_{t_str}"))
+            
+    for i in range(0, len(times_data), 4):
+        row = [InlineKeyboardButton(text, callback_data=cb) for text, cb in times_data[i:i+4]]
         keyboard.append(row)
         
     keyboard.append([InlineKeyboardButton("⬅️ Назад к календарю", callback_data="back_to_cal")])
@@ -527,12 +540,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         elif norm == "about":
             about_text = (
-                "<b>👩🎨 О мастере:</b>\n\n"
-                "Меня зовут Ирина, я сертифицированный мастер с опытом более 7 лет.\n"
-                "✅ Стерильность по СанПиН (3 этапа)\n"
-                "✅ Качественные материалы\n"
-                "✅ Уютная атмосфера и вкусный кофе\n\n"
-                "Буду рада видеть вас у себя!"
+                "<b>✨ Искусство преображения ваших рук ✨</b>\n\n"
+                "Привет! Я Ирина — топ-мастер с 7-летним стажем, который влюблен в свое дело. "
+                "Моя миссия — не просто сделать маникюр, а подчеркнуть вашу индивидуальность и подарить уверенность в себе.\n\n"
+                "<b>Почему выбирают меня:</b>\n"
+                "💎 <b>Безопасность:</b> Стерилизация по медицинским стандартам (СанПиН). Крафт-пакет вскрываю только при вас.\n"
+                "🎨 <b>Качество:</b> Работаю на премиум-материалах, которые носятся без сколов до 4-х недель.\n"
+                "☕️ <b>Комфорт:</b> Уютная студия, любимые сериалы, ароматный кофе и время только для себя.\n\n"
+                "<i>Ваши руки заслуживают лучшего ухода!</i>"
             )
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("📷 Фотогалерея", callback_data="show_gallery")],
@@ -691,6 +706,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "noop_past":
         await query.answer("Эта дата уже прошла или недоступна", show_alert=True)
         return
+    if data == "noop_booked":
+        await query.answer("Это время уже занято. Пожалуйста, выберите другое.", show_alert=True)
+        return
 
     if data == "to_menu":
         context.user_data["mode"] = None
@@ -716,7 +734,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, y, m, d = data.split("_")
         b_date = f"{y}-{int(m):02d}-{int(d):02d}"
         context.user_data["b_date"] = b_date
-        await query.edit_message_text(f"Выбрана дата: {b_date}\nВыберите время:", reply_markup=get_time_keyboard(b_date))
+        f_date = format_dt(b_date)
+        await query.edit_message_text(f"Выбрана дата: {f_date}\nВыберите время:", reply_markup=get_time_keyboard(b_date))
         
     elif data == "back_to_cal":
         now = datetime.now(MOSCOW_TZ)
@@ -733,13 +752,23 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     elif data == "confirm_booking":
         user_id = update.effective_user.id
+        b_date = context.user_data.get("b_date")
+        b_time = context.user_data.get("b_time")
+        
+        # Проверка на занятость (защита от одновременных кликов)
+        booked_times = db_get_booked_times(b_date)
+        if b_time in booked_times:
+            await query.answer("Извините, это время уже занято кем-то другим. Пожалуйста, выберите другое время.", show_alert=True)
+            await query.edit_message_text("Выберите другое время:", reply_markup=get_time_keyboard(b_date))
+            return
+
         is_first = not db_has_previous_bookings(user_id)
         
         b_id = db_save_booking(
             user_id, 
             context.user_data.get("b_service"),
-            context.user_data.get("b_date"),
-            context.user_data.get("b_time"),
+            b_date,
+            b_time,
             context.user_data.get("b_comment", "")
         )
         
@@ -749,13 +778,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(update, context, msg)
         
         user = db_get_user(user_id)
+        f_dt = format_dt(context.user_data.get('b_date'), context.user_data.get('b_time'))
         admin_text = (
             f"<b>🆕 Новая запись!</b>\n"
             f"{'🎁 АКЦИЯ: ПЕРВЫЙ ВИЗИТ (-7%)' if is_first else ''}\n\n"
             f"👤 Клиент: {user[1]} ({user[2]})\n"
             f"💅 Услуга: {context.user_data.get('b_service')}\n"
-            f"📅 Дата: {context.user_data.get('b_date')}\n"
-            f"⏰ Время: {context.user_data.get('b_time')}\n"
+            f"📅 Дата и время: {f_dt}\n"
         )
         if context.user_data.get("b_comment"):
             admin_text += f"💬 Комментарий: {context.user_data.get('b_comment')}\n"
@@ -870,10 +899,11 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
     
     for b in bookings:
         try:
+            f_dt = format_dt(b[3], b[4])
             text = (
                 "🔔 <b>Напоминание о записи завтра!</b>\n\n"
                 f"💅 Услуга: {b[2]}\n"
-                f"⏰ Время: {b[4]}\n"
+                f"📅 Дата и время: {f_dt}\n"
                 f"🏠 Адрес: {ADDRESS_TEXT}\n"
                 f"🔗 <a href='{MAPS_URL}'>Открыть на картах</a>\n\n"
                 "До встречи! 💛"
