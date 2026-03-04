@@ -93,9 +93,16 @@ def db_init():
             comment TEXT,
             status TEXT,
             created_at TEXT,
-            reminded INTEGER DEFAULT 0
+            reminded INTEGER DEFAULT 0,
+            UNIQUE(date, time) ON CONFLICT ABORT
         )
     """)
+    # Добавляем индекс для существующих баз данных
+    try:
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_bookings_date_time ON bookings(date, time) WHERE status != 'cancelled'")
+    except Exception as e:
+        logger.warning(f"Could not create unique index: {e}")
+    
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS reviews (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -135,13 +142,17 @@ def db_save_booking(user_id: int, service: str, b_date: str, b_time: str, commen
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     now = datetime.now(MOSCOW_TZ).isoformat()
-    cursor.execute("""
-        INSERT INTO bookings (user_id, service, date, time, comment, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (user_id, service, b_date, b_time, comment, "pending", now))
-    booking_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
+    try:
+        cursor.execute("""
+            INSERT INTO bookings (user_id, service, date, time, comment, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (user_id, service, b_date, b_time, comment, "pending", now))
+        booking_id = cursor.lastrowid
+        conn.commit()
+    except sqlite3.IntegrityError:
+        booking_id = None
+    finally:
+        conn.close()
     return booking_id
 
 def db_update_booking_status(booking_id: int, status: str):
@@ -549,6 +560,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "☕️ <b>Комфорт:</b> Уютная студия, любимые сериалы, ароматный кофе и время только для себя.\n\n"
                 "<i>Ваши руки заслуживают лучшего ухода!</i>"
             )
+            # Добавляем логирование для отладки
+            logger.info(f"User {user_id} requested 'About' section")
+            
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("📷 Фотогалерея", callback_data="show_gallery")],
                 [InlineKeyboardButton("⬅️ Назад", callback_data="to_menu")]
@@ -599,7 +613,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = "<b>❓ Часто задаваемые вопросы:</b>\n\n"
             for i, (q, a) in enumerate(FAQ_DATA, 1):
                 text += f"<b>{i}. {q}</b>\n— {a}\n\n"
-            await safe_send(update, context, text)
+            
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✍️ Написать мастеру", url="https://t.me/teymurlannn")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="to_menu")]
+            ])
+            await safe_send(update, context, text, reply_markup=kb)
             return
             
         elif norm == "menu":
@@ -771,6 +790,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             b_time,
             context.user_data.get("b_comment", "")
         )
+        
+        if b_id is None:
+            await query.answer("Извините, это время уже занято кем-то другим. Пожалуйста, выберите другое время.", show_alert=True)
+            await query.edit_message_text("Выберите другое время:", reply_markup=get_time_keyboard(b_date))
+            return
         
         msg = "✅ Запись создана! Ожидайте подтверждения мастера."
         if is_first:
