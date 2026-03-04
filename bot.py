@@ -103,6 +103,13 @@ def db_init():
             created_at TEXT
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS gallery (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id TEXT,
+            created_at TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -179,6 +186,29 @@ def db_has_previous_bookings(user_id: int) -> bool:
     count = cursor.fetchone()[0]
     conn.close()
     return count > 0
+
+def db_save_gallery_photo(file_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    now = datetime.now(MOSCOW_TZ).isoformat()
+    cursor.execute("INSERT INTO gallery (file_id, created_at) VALUES (?, ?)", (file_id, now))
+    conn.commit()
+    conn.close()
+
+def db_get_gallery_photos():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT file_id FROM gallery ORDER BY id DESC")
+    photos = [r[0] for r in cursor.fetchall()]
+    conn.close()
+    return photos
+
+def db_delete_last_photo():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM gallery WHERE id = (SELECT MAX(id) FROM gallery)")
+    conn.commit()
+    conn.close()
 
 def db_get_latest_reviews(limit: int = 5):
     conn = sqlite3.connect(DB_PATH)
@@ -273,17 +303,20 @@ async def safe_send(update: Update, context: ContextTypes.DEFAULT_TYPE, text: st
 # --- PHOTO GALLERY ---
 
 async def send_gallery(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
-    if not PHOTO_URLS:
+    db_photos = db_get_gallery_photos()
+    all_photos = db_photos if db_photos else PHOTO_URLS
+    
+    if not all_photos:
         await safe_send(update, context, "Фото скоро добавлю! 📸")
         return
     
-    page = page % len(PHOTO_URLS)
-    url = PHOTO_URLS[page]
+    page = page % len(all_photos)
+    url_or_id = all_photos[page]
     
     kb = [
         [
             InlineKeyboardButton("◀️ Назад", callback_data=f"gal_{page-1}"),
-            InlineKeyboardButton(f"{page+1} / {len(PHOTO_URLS)}", callback_data="noop"),
+            InlineKeyboardButton(f"{page+1} / {len(all_photos)}", callback_data="noop"),
             InlineKeyboardButton("Вперед ▶️", callback_data=f"gal_{page+1}")
         ],
         [InlineKeyboardButton("🏠 В меню", callback_data="to_menu")]
@@ -292,13 +325,13 @@ async def send_gallery(update: Update, context: ContextTypes.DEFAULT_TYPE, page:
     try:
         if update.callback_query and update.callback_query.message.photo:
             await update.callback_query.edit_message_media(
-                media=telegram.InputMediaPhoto(url, caption="Мои работы:"),
+                media=telegram.InputMediaPhoto(url_or_id, caption="Мои работы:"),
                 reply_markup=InlineKeyboardMarkup(kb)
             )
         else:
             msg = await context.bot.send_photo(
                 chat_id=update.effective_chat.id,
-                photo=url,
+                photo=url_or_id,
                 caption="Мои работы:",
                 reply_markup=InlineKeyboardMarkup(kb)
             )
@@ -438,6 +471,17 @@ async def on_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await safe_send(update, context, f"✅ Регистрация завершена!\nПриятно познакомиться, {name}.\n\nНажмите 📅 <b>Записаться</b>, чтобы выбрать время.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
     await track_message(context, update.message.message_id)
+
+async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return
+    if context.user_data.get("mode") != "admin_add_photo": return
+    
+    photo = update.message.photo[-1] # Best quality
+    db_save_gallery_photo(photo.file_id)
+    context.user_data["mode"] = None
+    
+    await safe_send(update, context, "✅ Фото успешно добавлено в галерею!")
+    await show_gallery_admin(update, context)
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -586,13 +630,24 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["mode"] = None
 
 async def show_admin_filters(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = "🛠 <b>Админ-панель</b>\n\nВыберите период для просмотра записей:"
+    text = "🛠 <b>Админ-панель</b>\n\nВыберите период для просмотра записей или управление контентом:"
     kb = [
         [InlineKeyboardButton("📅 На 7 дней", callback_data="adm_view_7"),
          InlineKeyboardButton("📅 На 14 дней", callback_data="adm_view_14")],
         [InlineKeyboardButton("📅 Все записи", callback_data="adm_view_9999")],
         [InlineKeyboardButton("🕒 Прошедшие (7 дней)", callback_data="adm_view_past_7")],
+        [InlineKeyboardButton("🖼 Управление галереей", callback_data="adm_gallery")],
         [InlineKeyboardButton("🏠 В меню", callback_data="to_menu")]
+    ]
+    await safe_send(update, context, text, reply_markup=InlineKeyboardMarkup(kb))
+
+async def show_gallery_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    photos = db_get_gallery_photos()
+    text = f"🖼 <b>Управление галереей</b>\n\nВсего фото в базе: {len(photos)}"
+    kb = [
+        [InlineKeyboardButton("➕ Добавить фото", callback_data="adm_gal_add")],
+        [InlineKeyboardButton("🗑 Удалить последнее", callback_data="adm_gal_del")],
+        [InlineKeyboardButton("⬅️ Назад в админку", callback_data="admin_back")]
     ]
     await safe_send(update, context, text, reply_markup=InlineKeyboardMarkup(kb))
 
@@ -741,6 +796,21 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 kb.append([InlineKeyboardButton("💬 Написать", callback_data=f"adm_msg_{b[1]} text")])
                 await safe_send(update, context, text, reply_markup=InlineKeyboardMarkup(kb))
 
+    elif data == "admin_back":
+        await show_admin_filters(update, context)
+
+    elif data == "adm_gallery":
+        await show_gallery_admin(update, context)
+        
+    elif data == "adm_gal_add":
+        context.user_data["mode"] = "admin_add_photo"
+        await safe_send(update, context, "📸 Пожалуйста, пришлите боту фотографию, которую хотите добавить в галерею.")
+        
+    elif data == "adm_gal_del":
+        db_delete_last_photo()
+        await query.answer("Последнее фото удалено", show_alert=True)
+        await show_gallery_admin(update, context)
+
     elif data.startswith("adm_conf_"):
         b_id = int(data.split("_")[2])
         db_update_booking_status(b_id, "confirmed")
@@ -825,6 +895,7 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(on_callback))
     application.add_handler(MessageHandler(filters.CONTACT, on_contact))
+    application.add_handler(MessageHandler(filters.PHOTO, on_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     job_queue = application.job_queue
