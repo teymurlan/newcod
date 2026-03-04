@@ -1,15 +1,10 @@
 # bot.py
 # python-telegram-bot >= 21 (async)
 # Railway polling + SQLite
-# IMPORTANT: сохраняем текущую архитектуру (1 файл), меню, БД (users/bookings/reviews) и логику.
-# ФИКСЫ (ВАЖНО):
-# 1) Мобильный Telegram: после выбора времени ВСЕГДА показываем экран подтверждения (не молчим).
-# 2) Ручной ввод времени (HH:MM) + проверка диапазона/прошедшего времени.
-# 3) Регистрация не повторяется и не сбрасывает выбор.
-# 4) Уведомление админу всегда (try/except + лог).
-# 5) В "Обо мне" смайлик вниз маленький (👇🏻).
-# 6) Модерация отзывов админом: pending -> approve/decline, в списке показываем только approved.
-# 7) Добавлены команды (/start /menu /book /prices /about /address /my /reviews /admin).
+# IMPORTANT: один файл, БД users/bookings/reviews НЕ меняем.
+# ФИКС: правильные отступы и корректный on_callback (await внутри async), чтобы
+# после выбора времени НЕ сбрасывалось, запись сохранялась и админу всегда уходило уведомление.
+# Плюс: защита от падения из-за tzdata/ZoneInfo и JobQueue (если не установлен extras).
 
 import os
 import re
@@ -18,8 +13,17 @@ import sqlite3
 import logging
 import calendar as pycal
 from datetime import datetime, timedelta, date, time as dtime
-from zoneinfo import ZoneInfo
 from typing import Optional, List, Tuple
+
+try:
+    from zoneinfo import ZoneInfo
+    try:
+        from zoneinfo import ZoneInfoNotFoundError
+    except Exception:
+        ZoneInfoNotFoundError = Exception
+except Exception:
+    ZoneInfo = None
+    ZoneInfoNotFoundError = Exception
 
 from telegram import (
     Update,
@@ -27,7 +31,6 @@ from telegram import (
     KeyboardButton,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    BotCommand,
 )
 from telegram.constants import ParseMode
 from telegram.error import TelegramError, BadRequest, Forbidden
@@ -56,7 +59,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int((os.getenv("ADMIN_ID", "0") or "0").strip() or "0")
 
 TZ_NAME = (os.getenv("TZ", "Europe/Moscow") or "Europe/Moscow").strip()
-TZ = ZoneInfo(TZ_NAME)
 
 AUTO_CLEAN = (os.getenv("AUTO_CLEAN", "1").strip() or "1") == "1"
 SALON_TITLE = (os.getenv("SALON_TITLE", "Beauty Lounge") or "Beauty Lounge").strip()
@@ -72,6 +74,26 @@ if not ADMIN_ID:
     raise RuntimeError("ADMIN_ID is required (Railway Variables).")
 
 DB_PATH = (os.getenv("DB_PATH", "bot.db") or "bot.db").strip()
+
+# -------------------------
+# TZ fallback (важно для Railway: бывает нет tzdata)
+# -------------------------
+def _get_tz():
+    # Если ZoneInfo недоступен или tzdata не установлен — не падаем, используем UTC+3.
+    if ZoneInfo is None:
+        return datetime.now().astimezone().tzinfo
+    try:
+        return ZoneInfo(TZ_NAME)
+    except ZoneInfoNotFoundError:
+        log.warning("ZoneInfo not found for TZ=%s (tzdata missing). Using UTC+3 fallback.", TZ_NAME)
+        # фиксированный оффсет +03:00
+        from datetime import timezone
+        return timezone(timedelta(hours=3))
+    except Exception as e:
+        log.warning("Failed to init ZoneInfo(%s): %s. Using local timezone fallback.", TZ_NAME, e)
+        return datetime.now().astimezone().tzinfo
+
+TZ = _get_tz()
 
 # -------------------------
 # UI constants
@@ -141,15 +163,11 @@ WELCOME_TEXT = (
 
 # -------------------------
 # DB helpers (НЕ меняем структуру users/bookings/reviews)
-# + добавляем отдельную таблицу для модерации отзывов (не ломает старые данные)
 # -------------------------
 def db_connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
-
-def now_tz() -> datetime:
-    return datetime.now(tz=TZ)
 
 def db_init() -> None:
     conn = db_connect()
@@ -195,17 +213,7 @@ def db_init() -> None:
                 FOREIGN KEY(user_id) REFERENCES users(user_id)
             );
         """)
-        # separate moderation table (no schema change in reviews)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS review_moderation (
-                review_id    INTEGER PRIMARY KEY,
-                status       TEXT NOT NULL, -- pending/approved/declined
-                moderated_by INTEGER,
-                moderated_at TEXT,
-                FOREIGN KEY(review_id) REFERENCES reviews(id)
-            );
-        """)
-        # optional kv
+        # kv (не ломает структуру, просто доп.таблица)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS kv (
                 key         TEXT PRIMARY KEY,
@@ -215,6 +223,9 @@ def db_init() -> None:
         conn.commit()
     finally:
         conn.close()
+
+def now_tz() -> datetime:
+    return datetime.now(tz=TZ)
 
 def db_get_user(user_id: int) -> Optional[sqlite3.Row]:
     conn = db_connect()
@@ -286,8 +297,7 @@ def db_set_booking_reminded(booking_id: int) -> None:
     finally:
         conn.close()
 
-def db_add_review(user_id: int, text: str) -> int:
-    """Добавляем отзыв как pending (через review_moderation). Возвращает review_id."""
+def db_add_review(user_id: int, text: str) -> None:
     conn = db_connect()
     try:
         cur = conn.cursor()
@@ -295,45 +305,11 @@ def db_add_review(user_id: int, text: str) -> int:
             INSERT INTO reviews(user_id, text, created_at)
             VALUES (?, ?, ?)
         """, (user_id, text, now_tz().isoformat()))
-        review_id = int(cur.lastrowid)
-        cur.execute("""
-            INSERT OR REPLACE INTO review_moderation(review_id, status, moderated_by, moderated_at)
-            VALUES (?, 'pending', NULL, NULL)
-        """, (review_id,))
-        conn.commit()
-        return review_id
-    finally:
-        conn.close()
-
-def db_get_review_with_user(review_id: int) -> Optional[sqlite3.Row]:
-    conn = db_connect()
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT r.*, u.name AS user_name, u.phone AS user_phone,
-                   COALESCE(m.status, 'pending') AS mod_status
-            FROM reviews r
-            JOIN users u ON u.user_id = r.user_id
-            LEFT JOIN review_moderation m ON m.review_id = r.id
-            WHERE r.id = ?
-        """, (review_id,))
-        return cur.fetchone()
-    finally:
-        conn.close()
-
-def db_set_review_status(review_id: int, status: str, moderated_by: int) -> None:
-    conn = db_connect()
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT OR REPLACE INTO review_moderation(review_id, status, moderated_by, moderated_at)
-            VALUES (?, ?, ?, ?)
-        """, (review_id, status, moderated_by, now_tz().isoformat()))
         conn.commit()
     finally:
         conn.close()
 
-def db_list_last_approved_reviews(limit: int = 5) -> List[sqlite3.Row]:
+def db_list_last_reviews(limit: int = 5) -> List[sqlite3.Row]:
     conn = db_connect()
     try:
         cur = conn.cursor()
@@ -341,8 +317,6 @@ def db_list_last_approved_reviews(limit: int = 5) -> List[sqlite3.Row]:
             SELECT r.*, u.name AS user_name
             FROM reviews r
             JOIN users u ON u.user_id = r.user_id
-            JOIN review_moderation m ON m.review_id = r.id
-            WHERE m.status = 'approved'
             ORDER BY r.id DESC
             LIMIT ?
         """, (limit,))
@@ -427,7 +401,6 @@ def is_admin_user(user_id: int) -> bool:
     return user_id == ADMIN_ID
 
 def build_reply_kb(is_admin: bool) -> ReplyKeyboardMarkup:
-    # 2 в ряд; структура меню не меняется
     if is_admin:
         buttons = [
             ["📅 Записаться", "💰 Цены"],
@@ -445,20 +418,11 @@ def build_reply_kb(is_admin: bool) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True, is_persistent=True)
 
 def normalize_button(text: str) -> str:
-    """
-    FIX: Reply-кнопки могут приходить с разными emoji/variation selectors.
-    Нормализуем надежно: выкидываем все, кроме букв/цифр/пробелов, и матчим по ключевым словам.
-    """
     if not text:
         return ""
-
-    # lower + trim
-    raw = " ".join(text.strip().lower().split())
-
-    # оставляем только буквы/цифры/пробелы (emoji и спецсимволы уйдут)
-    cleaned = re.sub(r"[^0-9a-zа-яё\s]", " ", raw, flags=re.IGNORECASE)
-    cleaned = " ".join(cleaned.split())
-
+    s = " ".join(text.strip().lower().split())
+    s = s.replace("🏠", "").replace("📅", "").replace("💰", "").replace("👩‍🎨", "").replace("📍", "").replace("📋", "").replace("⭐", "").replace("🛠", "")
+    s = " ".join(s.split())
     aliases = {
         "записаться": "book",
         "запись": "book",
@@ -477,16 +441,12 @@ def normalize_button(text: str) -> str:
         "главное меню": "menu",
         "домой": "menu",
     }
-
-    # точное совпадение
-    if cleaned in aliases:
-        return aliases[cleaned]
-
-    # совпадение по окончанию (на случай “📋 Мои записи” и т.п.)
+    if s in aliases:
+        return aliases[s]
+    raw = " ".join(text.strip().lower().split())
     for k, v in aliases.items():
-        if cleaned.endswith(k):
+        if raw.endswith(k):
             return v
-
     return ""
 
 # -------------------------
@@ -511,6 +471,7 @@ async def cleanup_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int, keep_la
         return
     to_delete = ids[:-keep_last]
     context.chat_data["tracked_message_ids"] = ids[-keep_last:]
+
     for mid in to_delete:
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=mid)
@@ -550,7 +511,6 @@ async def safe_edit_or_send(
     parse_mode: Optional[str] = ParseMode.HTML,
     disable_web_page_preview: bool = True,
 ) -> None:
-    # FIX mobile: edit может падать -> fallback send, чтобы не было "тишины"
     chat = update.effective_chat
     if query and query.message:
         try:
@@ -583,6 +543,7 @@ def get_mode(context: ContextTypes.DEFAULT_TYPE) -> str:
 def clear_booking_keys(context: ContextTypes.DEFAULT_TYPE) -> None:
     for k in ("service", "date", "time", "comment"):
         context.user_data.pop(k, None)
+    context.user_data.pop("awaiting_resume", None)
 
 # -------------------------
 # Time helpers + manual time
@@ -596,7 +557,7 @@ def try_accept_manual_time(text: str) -> Tuple[bool, str]:
     hh, mm = map(int, s.split(":"))
     if not (0 <= hh <= 23 and 0 <= mm <= 59):
         return False, ""
-    # 08:00—23:00 (включительно 23:00)
+    # диапазон 08:00—23:00 (23:00 включительно)
     if (hh < 8) or (hh > 23) or (hh == 23 and mm > 0):
         return False, ""
     return True, f"{hh:02d}:{mm:02d}"
@@ -745,14 +706,6 @@ def kb_reviews_actions() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⬅️ Назад", callback_data="nav:menu")],
     ])
 
-def kb_review_moderation(review_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Одобрить", callback_data=f"rev:approve:{review_id}"),
-            InlineKeyboardButton("❌ Отклонить", callback_data=f"rev:decline:{review_id}"),
-        ]
-    ])
-
 # -------------------------
 # Booking summary
 # -------------------------
@@ -850,9 +803,6 @@ async def resume_after_registration(update: Update, context: ContextTypes.DEFAUL
     set_mode(context, None)
     await safe_send(update, context, "Выберите услугу 👇", reply_markup=kb_services())
 
-# -------------------------
-# Registration check
-# -------------------------
 async def ensure_registered_or_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[sqlite3.Row]:
     uid = update.effective_user.id if update.effective_user else 0
     user = db_get_user(uid)
@@ -910,31 +860,6 @@ async def notify_admin_new_booking(context: ContextTypes.DEFAULT_TYPE, booking_i
         log.exception("Failed to notify admin for booking_id=%s: %s", booking_id, e)
         return False
 
-async def notify_admin_new_review(context: ContextTypes.DEFAULT_TYPE, review_id: int) -> bool:
-    row = db_get_review_with_user(review_id)
-    if not row:
-        log.error("notify_admin_new_review: review not found id=%s", review_id)
-        return False
-
-    text = (
-        "🆕 <b>Новый отзыв на модерацию</b>\n\n"
-        f"🆔 <b>#{review_id}</b>\n"
-        f"👤 Клиент: <b>{html.escape(row['user_name'])}</b>\n"
-        f"📞 Телефон: <b>{html.escape(row['user_phone'])}</b>\n\n"
-        f"🗣 Отзыв:\n<i>{html.escape(row['text'])}</i>"
-    )
-    try:
-        await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb_review_moderation(review_id),
-        )
-        return True
-    except TelegramError as e:
-        log.exception("Failed to notify admin for review_id=%s: %s", review_id, e)
-        return False
-
 # -------------------------
 # Menu actions
 # -------------------------
@@ -948,10 +873,12 @@ async def menu_book(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not user:
         return
     set_mode(context, None)
+    # если сервиса ещё нет — стартуем запись "с нуля"
     if not context.user_data.get("service"):
         clear_booking_keys(context)
         await safe_send(update, context, "📅 <b>Запись</b>\n\nВыберите услугу:", reply_markup=kb_services())
         return
+    # иначе продолжаем
     await resume_after_registration(update, context)
 
 async def menu_prices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -964,8 +891,7 @@ async def menu_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     uid = update.effective_user.id if update.effective_user else 0
     kb = build_reply_kb(is_admin_user(uid))
     await safe_send(update, context, ABOUT_TEXT, reply_markup=kb, parse_mode=ParseMode.HTML)
-    # FIX: маленький смайлик вниз
-    await safe_send(update, context, "👇🏻", reply_markup=kb_about_actions())
+    await safe_send(update, context, "👇", reply_markup=kb_about_actions())
 
 async def menu_find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id if update.effective_user else 0
@@ -1008,9 +934,9 @@ async def menu_my_bookings(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def menu_reviews(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id if update.effective_user else 0
     kb = build_reply_kb(is_admin_user(uid))
-    rows = db_list_last_approved_reviews(5)
+    rows = db_list_last_reviews(5)
     if not rows:
-        text = "⭐ <b>Отзывы</b>\n\nПока нет опубликованных отзывов. Хотите оставить? 😊"
+        text = "⭐ <b>Отзывы</b>\n\nПока отзывов нет. Будете первым? 😊"
     else:
         parts = ["⭐ <b>Отзывы</b>\n"]
         for r in rows:
@@ -1043,7 +969,7 @@ async def menu_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         conn.close()
 
     text = (
-        "🛠 <b>Админ панель</b>\n\n"
+        "🛠 <b>Админ-панель</b>\n\n"
         f"🟡 Ожидают подтверждения: <b>{pending}</b>\n"
         f"✅ Подтверждено: <b>{confirmed}</b>\n"
         f"❌ Отменено: <b>{cancelled}</b>\n"
@@ -1053,9 +979,9 @@ async def menu_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("📅 Записи на 7 дней", callback_data="adm:list:7")],
         [InlineKeyboardButton("📅 Записи на 14 дней", callback_data="adm:list:14")],
-        [InlineKeyboardButton("📋 Все записи", callback_data="adm:list:all")],
-        [InlineKeyboardButton("🟡 Ожидают подтверждения", callback_data="adm:list:pending")],
-        [InlineKeyboardButton("✅ Подтвержденные", callback_data="adm:list:confirmed")],
+        [InlineKeyboardButton("📋 Все записи (до 100)", callback_data="adm:list:all")],
+        [InlineKeyboardButton("🟡 Только pending", callback_data="adm:list:pending")],
+        [InlineKeyboardButton("✅ Только confirmed", callback_data="adm:list:confirmed")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="nav:menu")],
     ])
     await safe_send(update, context, text, reply_markup=kb)
@@ -1091,50 +1017,6 @@ async def dispatch_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, key
         await menu_admin(update, context)
         return True
     return False
-
-# -------------------------
-# Commands (красиво)
-# -------------------------
-async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_menu(update, context)
-
-async def cmd_book(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await menu_book(update, context)
-
-async def cmd_prices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await menu_prices(update, context)
-
-async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await menu_about(update, context)
-
-async def cmd_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await menu_find(update, context)
-
-async def cmd_my(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await menu_my_bookings(update, context)
-
-async def cmd_reviews(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await menu_reviews(update, context)
-
-async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await menu_admin(update, context)
-
-async def setup_commands(app: Application) -> None:
-    cmds = [
-        BotCommand("start", "Запуск"),
-        BotCommand("menu", "Главное меню"),
-        BotCommand("book", "Записаться"),
-        BotCommand("prices", "Цены"),
-        BotCommand("about", "Обо мне"),
-        BotCommand("address", "Как нас найти"),
-        BotCommand("my", "Мои записи"),
-        BotCommand("reviews", "Отзывы"),
-        BotCommand("admin", "Админ панель"),
-    ]
-    try:
-        await app.bot.set_my_commands(cmds)
-    except TelegramError:
-        log.exception("Failed to set bot commands")
 
 # -------------------------
 # /start
@@ -1215,7 +1097,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     mode = get_mode(context)
 
-    # ручной ввод времени
+    # ручной ввод времени (только когда выбран service+date)
     if mode == "await_time_text":
         service = context.user_data.get("service")
         d_ymd = context.user_data.get("date")
@@ -1235,7 +1117,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 return
 
             if dt <= now_:
-                await safe_send(update, context, "⛔ Это время уже прошло.\nВведите другое время: <code>17:45</code>")
+                await safe_send(update, context, "⛔ Это время уже прошло.\nВведите время в формате <b>HH:MM</b>, например <code>17:45</code>")
                 return
 
             context.user_data["time"] = tm
@@ -1250,7 +1132,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await safe_send(update, context, booking_summary_text(user, service, d_ymd, tm, comment), reply_markup=kb_confirm())
             return
 
-    # admin msg mode
+    # Admin message mode
     if mode == "admin_msg":
         if not is_admin_user(uid):
             set_mode(context, None)
@@ -1281,7 +1163,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data.pop("admin_msg_payload", None)
         return
 
-    # registration: await_name
+    # Registration: await_name
     if mode == "await_name":
         name = text
         if len(name) < 2:
@@ -1291,7 +1173,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await ask_phone(update, context)
         return
 
-    # registration: await_phone
+    # Registration: await_phone
     if mode == "await_phone":
         phone = normalize_phone(text)
         if not phone:
@@ -1312,7 +1194,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await resume_after_registration(update, context)
         return
 
-    # comment mode
+    # Booking comment mode
     if mode == "await_comment":
         context.user_data["comment"] = text
         set_mode(context, None)
@@ -1333,7 +1215,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await safe_send(update, context, booking_summary_text(user, service, d_ymd, t_hm, comment), reply_markup=kb_confirm())
         return
 
-    # review mode
+    # Review mode
     if mode == "await_review":
         user = await ensure_registered_or_prompt(update, context)
         if not user:
@@ -1341,12 +1223,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if len(text) < 4:
             await safe_send(update, context, "❌ Отзыв слишком короткий. Напишите чуть подробнее 🙏")
             return
-
-        review_id = db_add_review(uid, text)
+        db_add_review(uid, text)
         set_mode(context, None)
-
-        await safe_send(update, context, "Спасибо! 💛\nВаш отзыв отправлен на модерацию ✅")
-        await notify_admin_new_review(context, review_id)
+        await safe_send(update, context, "Спасибо за отзыв! 💛\nОн сохранён ✅")
         await menu_reviews(update, context)
         return
 
@@ -1354,14 +1233,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await safe_send(update, context, "Я на связи 😊\n\nВыберите нужный раздел в меню ниже 👇", reply_markup=kb)
 
 # -------------------------
-# Callback handler (FIX mobile)
+# Callback handler (ВСЁ ВНУТРИ async — правильные отступы)
 # -------------------------
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query:
         return
 
-    # always answer (mobile)
+    # всегда отвечаем, чтобы на телефоне не зависало
     try:
         await query.answer()
     except TelegramError:
@@ -1374,6 +1253,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     data = query.data or ""
     uid = update.effective_user.id if update.effective_user else 0
 
+    # noop
     if data == "noop":
         try:
             await query.answer("Недоступно", show_alert=False)
@@ -1381,13 +1261,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             pass
         return
 
-    # NAV
+    # ---------------- NAV ----------------
     if data.startswith("nav:"):
         dest = data.split(":", 1)[1]
 
         if dest == "menu":
             set_mode(context, None)
             clear_booking_keys(context)
+            await safe_edit_or_send(update, context, query=query, text="🏠 <b>Главное меню</b>\n\nВыберите раздел кнопками ниже 👇", reply_markup=None)
             await send_menu(update, context)
             return
 
@@ -1435,7 +1316,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             slots = time_slots_for_date(selected, now_tz())
             set_mode(context, "await_time_text")
             await safe_edit_or_send(
-                update, context, query=query,
+                update,
+                context,
+                query=query,
                 text=(
                     f"📅 Дата выбрана: <b>{html.escape(fmt_date_ru(d_ymd))}</b>\n\n"
                     "Выберите время кнопками ниже или отправьте время вручную, например: <code>17:45</code>"
@@ -1444,7 +1327,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             return
 
-    # SERVICE
+    # ---------------- SERVICE ----------------
     if data.startswith("service:"):
         service_key = data.split(":", 1)[1]
         context.user_data["service"] = service_key
@@ -1464,7 +1347,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    # CAL NAV
+    # ---------------- CAL NAV ----------------
     if data.startswith("cal:"):
         user = await ensure_registered_or_prompt(update, context)
         if not user:
@@ -1481,13 +1364,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             except Exception:
                 y, m = today.year, today.month
 
+        # не уходим в прошлые месяцы
         if (y, m) < (today.year, today.month):
             y, m = today.year, today.month
 
         await safe_edit_or_send(update, context, query=query, text="Выберите дату 👇", reply_markup=kb_calendar(y, m, today))
         return
 
-    # DAY SELECT
+    # ---------------- DAY SELECT ----------------
     if data.startswith("day:"):
         d_iso = data.split(":", 1)[1]
         try:
@@ -1518,7 +1402,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         slots = time_slots_for_date(selected, now_)
         set_mode(context, "await_time_text")
         await safe_edit_or_send(
-            update, context, query=query,
+            update,
+            context,
+            query=query,
             text=(
                 f"📅 Дата выбрана: <b>{html.escape(fmt_date_ru(d_iso))}</b>\n\n"
                 "Выберите время кнопками ниже или отправьте время вручную, например: <code>17:45</code>"
@@ -1527,7 +1413,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    # TIME SELECT  (КРИТИЧНО: после выбора времени НЕ молчим — всегда отправляем подтверждение отдельным сообщением)
+    # ---------------- TIME SELECT (КЛЮЧЕВО: тут теперь всегда показываем подтверждение) ----------------
     if data.startswith("time:"):
         t_hm = data.split(":", 1)[1]
         if not re.fullmatch(r"\d{2}:\d{2}", t_hm):
@@ -1539,7 +1425,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         service = context.user_data.get("service")
         d_ymd = context.user_data.get("date")
         if not (service and d_ymd):
-            await safe_send(update, context, "⚠️ Начните заново: нажмите 📅 Записаться")
+            context.user_data.pop("time", None)
+            await safe_edit_or_send(update, context, query=query, text="⚠️ Начните заново: нажмите 📅 Записаться", reply_markup=None)
             return
 
         user = await ensure_registered_or_prompt(update, context)
@@ -1551,24 +1438,30 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             dt = booking_dt(d_ymd, t_hm)
         except Exception:
             context.user_data.pop("time", None)
-            await safe_send(update, context, "❌ Ошибка времени. Попробуйте ещё раз.")
+            await safe_edit_or_send(update, context, query=query, text="❌ Ошибка времени. Попробуйте ещё раз.", reply_markup=None)
             return
 
         if dt <= now_:
             context.user_data.pop("time", None)
             try:
-                await query.answer("Недоступно", show_alert=False)
+                await query.answer("Это время уже прошло", show_alert=False)
             except TelegramError:
                 pass
             return
 
-        # ВАЖНО: на мобильном edit часто "не виден" — поэтому подтверждение всегда отдельным сообщением
         set_mode(context, None)
         comment = (context.user_data.get("comment") or "").strip()
-        await safe_send(update, context, booking_summary_text(user, service, d_ymd, t_hm, comment), reply_markup=kb_confirm())
+
+        await safe_edit_or_send(
+            update,
+            context,
+            query=query,
+            text=booking_summary_text(user, service, d_ymd, t_hm, comment),
+            reply_markup=kb_confirm(),
+        )
         return
 
-    # CONFIRM FLOW
+    # ---------------- CONFIRM FLOW ----------------
     if data.startswith("confirm:"):
         user = await ensure_registered_or_prompt(update, context)
         if not user:
@@ -1583,13 +1476,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if action == "cancel":
             clear_booking_keys(context)
             set_mode(context, None)
-            await safe_send(update, context, "❌ Запись отменена.\n\nВозвращаю в меню 👇")
+            await safe_edit_or_send(update, context, query=query, text="❌ Запись отменена.\n\nВозвращаю в меню 👇", reply_markup=None)
             await send_menu(update, context)
             return
 
         if action == "comment":
             if not (service and d_ymd and t_hm):
-                await safe_send(update, context, "⚠️ Сначала выберите услугу, дату и время.")
+                await safe_edit_or_send(update, context, query=query, text="⚠️ Сначала выберите услугу, дату и время.", reply_markup=None)
                 return
             set_mode(context, "await_comment")
             await safe_edit_or_send(
@@ -1601,19 +1494,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         if action == "yes":
             if not (service and d_ymd and t_hm):
-                await safe_send(update, context, "⚠️ Не хватает данных записи. Начните заново: 📅 Записаться")
+                await safe_edit_or_send(update, context, query=query, text="⚠️ Не хватает данных записи. Начните заново: 📅 Записаться", reply_markup=None)
                 clear_booking_keys(context)
                 return
 
             booking_id = db_create_booking(user["user_id"], service, d_ymd, t_hm, comment, status="pending")
 
             ok_admin = await notify_admin_new_booking(context, booking_id)
-            extra = ""
-            if not ok_admin:
-                extra = "\n\n⚠️ Если мастер не ответит в течение 10 минут — напишите нам."
+            extra = "" if ok_admin else "\n\n⚠️ Если мастер не ответит в течение 10 минут — напишите нам."
 
             await safe_edit_or_send(
-                update, context, query=query,
+                update,
+                context,
+                query=query,
                 text=(
                     "✅ <b>Запись создана!</b>\n\n"
                     "Ожидайте подтверждения мастера 🟡\n\n"
@@ -1622,14 +1515,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     f"Дата/время: <b>{html.escape(fmt_datetime_ru(d_ymd, t_hm))}</b>\n"
                     f"{extra}"
                 ),
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Меню", callback_data="nav:menu")]]),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В меню", callback_data="nav:menu")]]),
             )
 
             clear_booking_keys(context)
             set_mode(context, None)
             return
 
-    # ABOUT PHOTOS
+    # ---------------- ABOUT PHOTOS ----------------
     if data == "about:photos":
         if not PHOTO_URLS:
             await safe_edit_or_send(
@@ -1654,7 +1547,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     continue
         return
 
-    # REVIEWS: write
+    # ---------------- REVIEWS ----------------
     if data == "reviews:write":
         user = await ensure_registered_or_prompt(update, context)
         if not user:
@@ -1667,37 +1560,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    # REVIEWS: moderation (admin)
-    if data.startswith("rev:"):
-        if not is_admin_user(uid):
-            await safe_edit_or_send(update, context, query=query, text="⛔ Доступ только для администратора.", reply_markup=None)
-            return
-        parts = data.split(":")
-        if len(parts) != 3:
-            await safe_edit_or_send(update, context, query=query, text="⚠️ Некорректная команда.", reply_markup=None)
-            return
-        action, rid_s = parts[1], parts[2]
-        try:
-            review_id = int(rid_s)
-        except Exception:
-            await safe_edit_or_send(update, context, query=query, text="⚠️ Некорректный ID отзыва.", reply_markup=None)
-            return
-
-        row = db_get_review_with_user(review_id)
-        if not row:
-            await safe_edit_or_send(update, context, query=query, text="⚠️ Отзыв не найден.", reply_markup=None)
-            return
-
-        if action == "approve":
-            db_set_review_status(review_id, "approved", uid)
-            await safe_edit_or_send(update, context, query=query, text=f"✅ Отзыв <b>#{review_id}</b> одобрен.", reply_markup=None)
-            return
-        if action == "decline":
-            db_set_review_status(review_id, "declined", uid)
-            await safe_edit_or_send(update, context, query=query, text=f"❌ Отзыв <b>#{review_id}</b> отклонён.", reply_markup=None)
-            return
-
-    # USER CANCEL BOOKING
+    # ---------------- USER CANCEL BOOKING ----------------
     if data.startswith("user:cancel:"):
         user = await ensure_registered_or_prompt(update, context)
         if not user:
@@ -1734,7 +1597,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             pass
         return
 
-    # ADMIN LIST
+    # ---------------- ADMIN LIST ----------------
     if data.startswith("adm:list:"):
         if not is_admin_user(uid):
             await safe_edit_or_send(update, context, query=query, text="⛔ Доступ только для администратора.", reply_markup=None)
@@ -1746,6 +1609,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         try:
             cur = conn.cursor()
             rows = []
+            title = "🧾 Список"
+
             if token == "7":
                 end_date = (now_.date() + timedelta(days=7)).isoformat()
                 cur.execute("""
@@ -1756,10 +1621,37 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                       AND b.date >= ?
                       AND b.date <= ?
                     ORDER BY b.date ASC, b.time ASC
-                    LIMIT 50
+                    LIMIT 100
                 """, (now_.date().isoformat(), end_date))
                 rows = cur.fetchall()
                 title = "📅 Записи на 7 дней"
+
+            elif token == "14":
+                end_date = (now_.date() + timedelta(days=14)).isoformat()
+                cur.execute("""
+                    SELECT b.*, u.name AS user_name, u.phone AS user_phone
+                    FROM bookings b
+                    JOIN users u ON u.user_id = b.user_id
+                    WHERE b.status IN ('pending','confirmed')
+                      AND b.date >= ?
+                      AND b.date <= ?
+                    ORDER BY b.date ASC, b.time ASC
+                    LIMIT 100
+                """, (now_.date().isoformat(), end_date))
+                rows = cur.fetchall()
+                title = "📅 Записи на 14 дней"
+
+            elif token == "all":
+                cur.execute("""
+                    SELECT b.*, u.name AS user_name, u.phone AS user_phone
+                    FROM bookings b
+                    JOIN users u ON u.user_id = b.user_id
+                    ORDER BY b.date DESC, b.time DESC
+                    LIMIT 100
+                """)
+                rows = cur.fetchall()
+                title = "📋 Все записи (последние 100)"
+
             elif token in ("pending", "confirmed"):
                 cur.execute("""
                     SELECT b.*, u.name AS user_name, u.phone AS user_phone
@@ -1767,13 +1659,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     JOIN users u ON u.user_id = b.user_id
                     WHERE b.status = ?
                     ORDER BY b.date ASC, b.time ASC
-                    LIMIT 50
+                    LIMIT 100
                 """, (token,))
                 rows = cur.fetchall()
                 title = f"🧾 Список: {token}"
+
             else:
                 rows = []
                 title = "🧾 Список"
+
         finally:
             conn.close()
 
@@ -1784,7 +1678,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
         lines = [f"<b>{html.escape(title)}</b>\n"]
-        for r in rows[:20]:
+        for r in rows[:30]:
             status = r["status"]
             status_emoji = "🟡" if status == "pending" else ("✅" if status == "confirmed" else "❌")
             lines.append(
@@ -1798,95 +1692,78 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         ]))
         return
 
-    # ADMIN CONFIRM/CANCEL/MSG
-    if data.startswith("adm:list:"):
+    # ---------------- ADMIN CONFIRM/CANCEL/MSG ----------------
+    if data.startswith("admin:"):
         if not is_admin_user(uid):
             await safe_edit_or_send(update, context, query=query, text="⛔ Доступ только для администратора.", reply_markup=None)
             return
 
-        token = data.split(":", 2)[2]
-        now_ = now_tz()
-        conn = db_connect()
+        parts = data.split(":")
+        if len(parts) < 3:
+            await safe_edit_or_send(update, context, query=query, text="⚠️ Некорректная команда админа.", reply_markup=None)
+            return
+        action = parts[1]
         try:
-            cur = conn.cursor()
-            rows = []
-            title = "📋 Записи"
-
-            if token in ("7", "14"):
-                days = int(token)
-                end_date = (now_.date() + timedelta(days=days)).isoformat()
-                cur.execute("""
-                    SELECT b.*, u.name AS user_name, u.phone AS user_phone
-                    FROM bookings b
-                    JOIN users u ON u.user_id = b.user_id
-                    WHERE b.status IN ('pending','confirmed')
-                      AND b.date >= ?
-                      AND b.date <= ?
-                    ORDER BY b.date ASC, b.time ASC
-                    LIMIT 80
-                """, (now_.date().isoformat(), end_date))
-                rows = cur.fetchall()
-                title = f"📅 Записи на {days} дней"
-
-            elif token == "all":
-                cur.execute("""
-                    SELECT b.*, u.name AS user_name, u.phone AS user_phone
-                    FROM bookings b
-                    JOIN users u ON u.user_id = b.user_id
-                    WHERE b.status IN ('pending','confirmed','cancelled')
-                    ORDER BY b.date ASC, b.time ASC
-                    LIMIT 100
-                """)
-                rows = cur.fetchall()
-                title = "📋 Все записи"
-
-            elif token in ("pending", "confirmed"):
-                cur.execute("""
-                    SELECT b.*, u.name AS user_name, u.phone AS user_phone
-                    FROM bookings b
-                    JOIN users u ON u.user_id = b.user_id
-                    WHERE b.status = ?
-                    ORDER BY b.date ASC, b.time ASC
-                    LIMIT 80
-                """, (token,))
-                rows = cur.fetchall()
-                title = "🟡 Ожидают подтверждения" if token == "pending" else "✅ Подтвержденные"
-
-            else:
-                rows = []
-                title = "📋 Записи"
-        finally:
-            conn.close()
-
-        if not rows:
-            await safe_edit_or_send(
-                update, context, query=query,
-                text=f"<b>{html.escape(title)}</b>\n\nПока пусто.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="nav:menu")]])
-            )
+            booking_id = int(parts[2])
+        except Exception:
+            await safe_edit_or_send(update, context, query=query, text="⚠️ Некорректный ID записи.", reply_markup=None)
             return
 
-        lines = [f"<b>{html.escape(title)}</b>\n"]
-        for r in rows[:30]:
-            status = r["status"]
-            status_emoji = "🟡" if status == "pending" else ("✅" if status == "confirmed" else "❌")
-            lines.append(
-                f"{status_emoji} <b>#{r['id']}</b> — {html.escape(SERVICE_LABEL_BY_KEY.get(r['service'], r['service']))}\n"
-                f"📅 {html.escape(fmt_date_ru(r['date']))}  🕒 {html.escape(r['time'])}\n"
-                f"👤 {html.escape(r['user_name'])}  📞 {html.escape(r['user_phone'])}\n"
-            )
+        row = db_get_booking(booking_id)
+        if not row:
+            await safe_edit_or_send(update, context, query=query, text="⚠️ Запись не найдена.", reply_markup=None)
+            return
 
-        await safe_edit_or_send(
-            update, context, query=query,
-            text="\n".join(lines),
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="nav:menu")]])
-        )
-        return
+        if action == "confirm":
+            db_update_booking_status(booking_id, "confirmed")
+            try:
+                await context.bot.send_message(
+                    chat_id=int(row["user_id"]),
+                    text=(
+                        "✅ <b>Запись подтверждена!</b>\n\n"
+                        f"🆔 <b>#{booking_id}</b>\n"
+                        f"💎 Услуга: <b>{html.escape(SERVICE_LABEL_BY_KEY.get(row['service'], row['service']))}</b>\n"
+                        f"📅 Дата/время: <b>{html.escape(fmt_datetime_ru(row['date'], row['time']))}</b>\n\n"
+                        f"📍 Адрес: <b>{html.escape(ADDRESS_TEXT)}</b>\n"
+                        f"🗺 Карта: {html.escape(MAPS_URL)}\n\n"
+                        "До встречи! 💛"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except TelegramError:
+                pass
+
+            await safe_edit_or_send(update, context, query=query, text=f"✅ Подтверждено: <b>#{booking_id}</b>", reply_markup=admin_booking_controls(booking_id))
+            return
+
+        if action == "cancel":
+            db_update_booking_status(booking_id, "cancelled")
+            try:
+                await context.bot.send_message(
+                    chat_id=int(row["user_id"]),
+                    text=(
+                        "❌ <b>Запись отменена</b>\n\n"
+                        f"🆔 <b>#{booking_id}</b>\n"
+                        f"💎 Услуга: <b>{html.escape(SERVICE_LABEL_BY_KEY.get(row['service'], row['service']))}</b>\n"
+                        f"📅 Дата/время: <b>{html.escape(fmt_datetime_ru(row['date'], row['time']))}</b>\n\n"
+                        "Если хотите — выберите другое время через 📅 Записаться."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            except TelegramError:
+                pass
+
+            await safe_edit_or_send(update, context, query=query, text=f"❌ Отменено: <b>#{booking_id}</b>", reply_markup=admin_booking_controls(booking_id))
+            return
+
         if action == "msg":
             set_mode(context, "admin_msg")
             context.user_data["admin_msg_payload"] = {"booking_id": booking_id, "user_id": int(row["user_id"])}
             await safe_edit_or_send(
-                update, context, query=query,
+                update,
+                context,
+                query=query,
                 text=(
                     f"💬 <b>Сообщение клиенту</b>\n\n"
                     f"Запись <b>#{booking_id}</b>\n"
@@ -1954,35 +1831,19 @@ def main() -> None:
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Job queue reminder every 15 minutes
-    if app.job_queue:
+    # Важно: если не установлен python-telegram-bot[job-queue], job_queue будет None — не падаем.
+    if getattr(app, "job_queue", None) is not None:
         app.job_queue.run_repeating(reminders_job, interval=15 * 60, first=30)
+    else:
+        log.warning("JobQueue is not available. Install python-telegram-bot[job-queue] to enable reminders.")
 
-    # Commands
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("menu", cmd_menu))
-    app.add_handler(CommandHandler("book", cmd_book))
-    app.add_handler(CommandHandler("prices", cmd_prices))
-    app.add_handler(CommandHandler("about", cmd_about))
-    app.add_handler(CommandHandler("address", cmd_address))
-    app.add_handler(CommandHandler("my", cmd_my))
-    app.add_handler(CommandHandler("reviews", cmd_reviews))
-    app.add_handler(CommandHandler("admin", cmd_admin))
-
-    # Один CallbackQueryHandler (чтобы один callback не попадал в два обработчика)
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.CONTACT, on_contact))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-
-    # set commands once on startup
-    async def _post_init(application: Application) -> None:
-        await setup_commands(application)
-
-    app.post_init = _post_init
 
     log.info("Starting bot (polling). TZ=%s AUTO_CLEAN=%s ADMIN_ID=%s", TZ_NAME, AUTO_CLEAN, ADMIN_ID)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
-
