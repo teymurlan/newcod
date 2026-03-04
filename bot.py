@@ -980,8 +980,8 @@ async def menu_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         [InlineKeyboardButton("📅 Записи на 7 дней", callback_data="adm:list:7")],
         [InlineKeyboardButton("📅 Записи на 14 дней", callback_data="adm:list:14")],
         [InlineKeyboardButton("📋 Все записи (до 100)", callback_data="adm:list:all")],
-        [InlineKeyboardButton("🟡 Только pending", callback_data="adm:list:pending")],
-        [InlineKeyboardButton("✅ Только confirmed", callback_data="adm:list:confirmed")],
+        [InlineKeyboardButton("🟡 Только ожидают (pending)", callback_data="adm:list:pending")],
+        [InlineKeyboardButton("✅ Только подтверждённые", callback_data="adm:list:confirmed")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="nav:menu")],
     ])
     await safe_send(update, context, text, reply_markup=kb)
@@ -1413,7 +1413,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    # ---------------- TIME SELECT (КЛЮЧЕВО: тут теперь всегда показываем подтверждение) ----------------
+    # ---------------- TIME SELECT (ФИКС: подтверждение всегда показываем сразу) ----------------
     if data.startswith("time:"):
         t_hm = data.split(":", 1)[1]
         if not re.fullmatch(r"\d{2}:\d{2}", t_hm):
@@ -1452,11 +1452,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         set_mode(context, None)
         comment = (context.user_data.get("comment") or "").strip()
 
-        await safe_edit_or_send(
+        # 1) Пробуем аккуратно обновить сообщение с выбором времени (не критично)
+        try:
+            if query.message:
+                await query.message.edit_reply_markup(reply_markup=None)
+        except TelegramError:
+            pass
+
+        # 2) КЛЮЧЕВОЕ: подтверждение отправляем отдельным сообщением (всегда видно)
+        await safe_send(
             update,
             context,
-            query=query,
-            text=booking_summary_text(user, service, d_ymd, t_hm, comment),
+            booking_summary_text(user, service, d_ymd, t_hm, comment),
             reply_markup=kb_confirm(),
         )
         return
@@ -1609,7 +1616,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         try:
             cur = conn.cursor()
             rows = []
-            title = "🧾 Список"
+            title = "🧾 Список записей"
 
             if token == "7":
                 end_date = (now_.date() + timedelta(days=7)).isoformat()
@@ -1662,11 +1669,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     LIMIT 100
                 """, (token,))
                 rows = cur.fetchall()
-                title = f"🧾 Список: {token}"
+                title = "🟡 Ожидают подтверждения" if token == "pending" else "✅ Подтверждённые записи"
 
             else:
                 rows = []
-                title = "🧾 Список"
+                title = "🧾 Список записей"
 
         finally:
             conn.close()
@@ -1761,8 +1768,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             set_mode(context, "admin_msg")
             context.user_data["admin_msg_payload"] = {"booking_id": booking_id, "user_id": int(row["user_id"])}
             await safe_edit_or_send(
-                update,
-                context,
+                update, context,
                 query=query,
                 text=(
                     f"💬 <b>Сообщение клиенту</b>\n\n"
