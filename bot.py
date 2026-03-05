@@ -40,8 +40,12 @@ def get_env_int(name, default):
     val = os.getenv(name, "")
     if not val or not val.strip():
         return int(default)
+    # Remove all spaces and common typos
+    clean_val = val.replace(" ", "").replace("−", "-").strip()
+    if not clean_val:
+        return int(default)
     try:
-        return int(val.strip())
+        return int(clean_val)
     except ValueError:
         print(f"WARNING: Invalid value for {name}: '{val}'. Using default: {default}")
         return int(default)
@@ -416,6 +420,10 @@ async def send_gallery(update: Update, context: ContextTypes.DEFAULT_TYPE, page:
 
 async def send_notification(context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None):
     """Отправляет уведомление в чат уведомлений или админу."""
+    if NOTIFICATION_CHAT_ID == 0:
+        print("WARNING: NOTIFICATION_CHAT_ID is 0. Cannot send notification.")
+        return
+
     try:
         await context.bot.send_message(
             chat_id=NOTIFICATION_CHAT_ID,
@@ -424,18 +432,20 @@ async def send_notification(context: ContextTypes.DEFAULT_TYPE, text: str, reply
             parse_mode="HTML"
         )
     except Exception as e:
-        print(f"Error sending notification to {NOTIFICATION_CHAT_ID}: {e}")
-        # Если не удалось отправить в группу, пробуем отправить админу напрямую (если это не один и тот же чат)
-        if NOTIFICATION_CHAT_ID != ADMIN_ID:
+        error_msg = str(e)
+        print(f"Error sending notification to {NOTIFICATION_CHAT_ID}: {error_msg}")
+        
+        # Если не удалось отправить в группу, пробуем отправить админу напрямую
+        if ADMIN_ID != 0 and NOTIFICATION_CHAT_ID != ADMIN_ID:
             try:
                 await context.bot.send_message(
                     chat_id=ADMIN_ID,
-                    text=f"⚠️ <b>Ошибка уведомления в группу:</b> {e}\n\n{text}",
+                    text=f"⚠️ <b>Ошибка уведомления в чат {NOTIFICATION_CHAT_ID}:</b>\n<code>{error_msg}</code>\n\n{text}",
                     reply_markup=reply_markup,
                     parse_mode="HTML"
                 )
             except Exception as e2:
-                print(f"Error sending emergency notification to admin: {e2}")
+                print(f"Error sending emergency notification to admin {ADMIN_ID}: {e2}")
 
 # --- KEYBOARDS ---
 
@@ -557,6 +567,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not user:
         welcome_text += "Для начала работы, пожалуйста, пройдите короткую регистрацию."
+        if ADMIN_ID == 0:
+            welcome_text += (
+                "\n\n⚠️ <b>Внимание:</b> Бот еще не настроен.\n"
+                f"Ваш ID: <code>{user_id}</code>\n"
+                "Добавьте его в переменную <code>ADMIN_ID</code> в Railway."
+            )
         await safe_send(update, context, welcome_text, reply_markup=get_main_menu_keyboard(user_id))
         await safe_send(update, context, "Как мне к вам обращаться? Введите ваше имя:")
         context.user_data["mode"] = "await_name"
@@ -1149,8 +1165,36 @@ async def post_init(application: Application):
         ("menu", "Главное меню"),
         ("recommendation", "Рекомендации по уходу"),
         ("faq", "Вопросы и ответы"),
-        ("prices", "Цены на услуги")
+        ("prices", "Цены на услуги"),
+        ("id", "Узнать ID чата"),
+        ("debug", "Проверить настройки (админ)"),
+        ("test", "Тест уведомлений")
     ])
+
+async def test_notify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Тестовое уведомление."""
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID and ADMIN_ID != 0:
+        return
+    await update.message.reply_text("🔔 Отправляю тестовое уведомление...")
+    await send_notification(context, "🔔 Это тестовое уведомление! Если вы его видите, значит всё настроено верно.")
+
+async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для проверки конфигурации (только для админа)."""
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID and ADMIN_ID != 0:
+        await update.message.reply_text("⛔️ У вас нет прав для этой команды.")
+        return
+        
+    text = (
+        "⚙️ <b>Текущая конфигурация:</b>\n\n"
+        f"👤 <b>ADMIN_ID:</b> <code>{ADMIN_ID}</code>\n"
+        f"📢 <b>NOTIFICATION_CHAT_ID:</b> <code>{NOTIFICATION_CHAT_ID}</code>\n"
+        f"🕒 <b>Timezone:</b> <code>{TZ_NAME}</code>\n"
+        f"🏠 <b>Salon:</b> <code>{SALON_TITLE}</code>\n\n"
+        "<i>Если ID равен 0, значит переменная не настроена в Railway.</i>"
+    )
+    await update.message.reply_text(text, parse_mode="HTML")
 
 async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда для получения ID текущего чата."""
@@ -1158,9 +1202,11 @@ async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     await update.message.reply_text(
         f"🆔 <b>Информация об ID:</b>\n\n"
-        f"Этот чат (Chat ID): <code>{chat_id}</code>\n"
-        f"Ваш ID (User ID): <code>{user_id}</code>\n\n"
-        f"Скопируйте Chat ID и добавьте его в переменную <code>NOTIFICATION_CHAT_ID</code>.",
+        f"📍 <b>ID этого чата:</b> <code>{chat_id}</code>\n"
+        f"👤 <b>Ваш личный ID:</b> <code>{user_id}</code>\n\n"
+        "📝 <b>Инструкция:</b>\n"
+        "1. Если вы хотите получать уведомления в <b>ЭТОТ</b> чат (группу), скопируйте 📍 <b>ID этого чата</b> и вставьте его в <code>NOTIFICATION_CHAT_ID</code>.\n"
+        "2. Обязательно вставьте 👤 <b>Ваш личный ID</b> в переменную <code>ADMIN_ID</code>, чтобы вы могли управлять ботом.",
         parse_mode="HTML"
     )
 
@@ -1177,6 +1223,8 @@ def main():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("id", id_command))
+    application.add_handler(CommandHandler("debug", debug_command))
+    application.add_handler(CommandHandler("test", test_notify_command))
     application.add_handler(CommandHandler("menu", menu_command))
     application.add_handler(CommandHandler("recommendation", recommendation_command))
     application.add_handler(CommandHandler("faq", faq_command))
