@@ -57,6 +57,8 @@ AUTO_CLEAN = os.getenv("AUTO_CLEAN", "1") == "1"
 SALON_TITLE = os.getenv("SALON_TITLE", "Beauty Lounge")
 MAPS_URL = os.getenv("MAPS_URL", "https://yandex.ru/maps/")
 ADDRESS_TEXT = os.getenv("ADDRESS_TEXT", "Дальневосточный проспект 19 к 1, кв 69, этаж 10")
+MASTER_PHONE = os.getenv("MASTER_PHONE", "+79990000000")
+MASTER_TG = os.getenv("MASTER_TG", "teymurlannn")
 
 SERVICE_PRICES = {
     "Маникюр с покрытием": 2500,
@@ -84,14 +86,7 @@ FAQ_DATA = [
 ]
 
 PHOTO_URLS = [
-    "https://picsum.photos/seed/nails1/800/600",
-    "https://picsum.photos/seed/nails2/800/600",
-    "https://picsum.photos/seed/nails3/800/600",
-    "https://picsum.photos/seed/nails4/800/600",
-    "https://picsum.photos/seed/nails5/800/600",
-    "https://picsum.photos/seed/nails6/800/600",
-    "https://picsum.photos/seed/nails7/800/600",
-    "https://picsum.photos/seed/nails8/800/600"
+    f"https://picsum.photos/seed/nails{i}/800/600" for i in range(1, 21)
 ]
 
 logging.basicConfig(
@@ -622,10 +617,9 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         photo = update.message.photo[-1] # Best quality
         db_save_gallery_photo(photo.file_id)
-        context.user_data["mode"] = None
         
-        await safe_send(update, context, "✅ Фото успешно добавлено в галерею!")
-        await show_gallery_admin(update, context)
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Готово", callback_data="adm_gal_manage")]])
+        await safe_send(update, context, "✅ Фото добавлено! Вы можете отправить еще или нажать «Готово».", reply_markup=kb)
     except Exception as e:
         logger.error(f"Error saving photo: {e}")
         await safe_send(update, context, "❌ Ошибка при сохранении фото. Попробуйте еще раз.")
@@ -701,8 +695,20 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for b in bookings:
                     status_emoji = "⏳" if b[6] == "pending" else "✅"
                     f_dt = format_dt(b[3], b[4])
-                    b_text = f"<b>📋 Запись:</b>\n\n{status_emoji} {b[2]}\n📅 {f_dt}\n"
-                    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить запись", callback_data=f"cancel_b_{b[0]}")]])
+                    b_text = (
+                        f"<b>📋 Запись:</b>\n\n"
+                        f"{status_emoji} {b[2]}\n"
+                        f"📅 {f_dt}\n\n"
+                        f"🔄 <b>Как перенести запись?</b>\n"
+                        f"Для переноса времени, пожалуйста, свяжитесь со мной напрямую через кнопки ниже."
+                    )
+                    kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("❌ Отменить запись", callback_data=f"cancel_b_{b[0]}")],
+                        [
+                            InlineKeyboardButton("📱 SMS", url=f"sms:{MASTER_PHONE}"),
+                            InlineKeyboardButton("💬 Telegram", url=f"https://t.me/{MASTER_TG}")
+                        ]
+                    ])
                     await safe_send(update, context, b_text, reply_markup=kb)
             return
         elif norm == "reviews":
@@ -729,7 +735,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text += f"<b>{i}. {q}</b>\n— {a}\n\n"
             
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✍️ Написать мастеру", url="https://t.me/teymurlannn")],
+                [
+                    InlineKeyboardButton("📱 SMS", url=f"sms:{MASTER_PHONE}"),
+                    InlineKeyboardButton("💬 Telegram", url=f"https://t.me/{MASTER_TG}")
+                ],
                 [InlineKeyboardButton("⬅️ Назад", callback_data="to_menu")]
             ])
             await safe_send(update, context, text, reply_markup=kb)
@@ -843,7 +852,10 @@ async def faq_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"<b>{i}. {q}</b>\n— {a}\n\n"
     
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✍️ Написать мастеру", url="https://t.me/teymurlannn")],
+        [
+            InlineKeyboardButton("📱 SMS", url=f"sms:{MASTER_PHONE}"),
+            InlineKeyboardButton("💬 Telegram", url=f"https://t.me/{MASTER_TG}")
+        ],
         [InlineKeyboardButton("⬅️ Назад", callback_data="to_menu")]
     ])
     await safe_send(update, context, text, reply_markup=kb)
@@ -1121,7 +1133,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     elif data == "adm_gal_add":
         context.user_data["mode"] = "admin_add_photo"
-        await safe_send(update, context, "📸 Пожалуйста, пришлите боту фотографию, которую хотите добавить в галерею.")
+        await safe_send(update, context, "📸 Пожалуйста, пришлите боту фотографию (или несколько), которую хотите добавить в галерею.")
+        
+    elif data == "adm_gal_manage":
+        context.user_data["mode"] = None
+        await show_gallery_admin(update, context)
         
     elif data == "adm_gal_del":
         db_delete_last_photo()
