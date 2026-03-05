@@ -1018,8 +1018,8 @@ def main():
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler(["menu", "меню"], menu_command))
-    application.add_handler(CommandHandler(["recommendation", "рекомендация"], recommendation_command))
+    application.add_handler(CommandHandler("menu", menu_command))
+    application.add_handler(CommandHandler("recommendation", recommendation_command))
     application.add_handler(CallbackQueryHandler(on_callback))
     application.add_handler(MessageHandler(filters.CONTACT, on_contact))
     application.add_handler(MessageHandler(filters.PHOTO, on_photo))
