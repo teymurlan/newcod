@@ -554,6 +554,8 @@ def get_confirm_keyboard():
 # --- HANDLERS ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        return
     user_id = update.effective_user.id
     user = db_get_user(user_id)
     
@@ -584,7 +586,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await track_message(context, update.message.message_id)
 
 async def on_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("mode") != "await_phone": return
+    if update.effective_chat.type != "private":
+        try: await update.message.delete()
+        except: pass
+        return
+    if context.user_data.get("mode") != "await_phone": 
+        try: await update.message.delete()
+        except: pass
+        return
     
     contact = update.message.contact
     phone = contact.phone_number
@@ -597,8 +606,18 @@ async def on_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await track_message(context, update.message.message_id)
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    if context.user_data.get("mode") != "admin_add_photo": return
+    if update.effective_chat.type != "private":
+        try: await update.message.delete()
+        except: pass
+        return
+    if update.effective_user.id != ADMIN_ID: 
+        try: await update.message.delete()
+        except: pass
+        return
+    if context.user_data.get("mode") != "admin_add_photo": 
+        try: await update.message.delete()
+        except: pass
+        return
     
     try:
         photo = update.message.photo[-1] # Best quality
@@ -612,15 +631,26 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(update, context, "❌ Ошибка при сохранении фото. Попробуйте еще раз.")
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
     user_id = update.effective_user.id
     text = update.message.text
+    
+    # 0. Если это группа - удаляем всё, кроме команды /id
+    if chat.type != "private":
+        if not text.startswith('/id'):
+            try: await update.message.delete()
+            except: pass
+        return
+
     norm = normalize_button(text)
+    mode = context.user_data.get("mode")
     
     await track_message(context, update.message.message_id)
     
     # 1. Если нажата кнопка меню - ВСЕГДА сбрасываем режим и выполняем команду
     if norm:
         context.user_data["mode"] = None
+        # ... (rest of the logic remains same)
         
         if norm == "book":
             user = db_get_user(user_id)
@@ -770,6 +800,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except:
                 await safe_send(update, context, "❌ Не удалось отправить сообщение.")
         context.user_data["mode"] = None
+        return
+
+    # 3. Если нет режима и это не кнопка - УДАЛЯЕМ (Анти-спам)
+    if not norm and not mode:
+        try: await update.message.delete()
+        except: pass
 
 async def recommendation_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
@@ -987,8 +1023,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         
         if b_id is None:
-            await query.answer("Извините, это время уже занято кем-то другим. Пожалуйста, выберите другое время.", show_alert=True)
-            await query.edit_message_text("Выберите другое время:", reply_markup=get_time_keyboard(b_date))
+            await query.answer("⚠️ К сожалению, это время уже занято.", show_alert=True)
+            await query.edit_message_text(
+                "😔 К сожалению, это время только что заняли.\n\n"
+                "Пожалуйста, выберите другое время или другой день:", 
+                reply_markup=get_time_keyboard(b_date)
+            )
             return
         
         msg = f"✅ Запись создана! Ожидайте подтверждения мастера.\n\n💰 К оплате: <b>{final_price} ₽</b>"
@@ -1107,6 +1147,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("cancel_b_"):
         b_id = int(data.split("_")[2])
         booking = db_get_booking(b_id)
+        if not booking:
+            await query.answer("Запись не найдена.", show_alert=True)
+            return
+            
+        if booking[6] == "cancelled":
+            await query.answer("Запись уже отменена.", show_alert=True)
+            return
+            
+        if booking[6] == "confirmed":
+            await query.answer("Запись уже подтверждена мастером. Для отмены свяжитесь с мастером напрямую.", show_alert=True)
+            return
+
         db_update_booking_status(b_id, "cancelled")
         await query.edit_message_text("❌ Запись отменена.")
         user = db_get_user(user_id)
@@ -1232,6 +1284,12 @@ def main():
     application.add_handler(MessageHandler(filters.CONTACT, on_contact))
     application.add_handler(MessageHandler(filters.PHOTO, on_photo))
     application.add_handler(MessageHandler(filters.TEXT, on_text))
+    
+    # Анти-спам для всего остального (стикеры, видео, гифки и т.д.)
+    async def cleanup_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try: await update.message.delete()
+        except: pass
+    application.add_handler(MessageHandler(~filters.COMMAND, cleanup_all))
 
     job_queue = application.job_queue
     job_queue.run_repeating(reminder_job, interval=600, first=10)
