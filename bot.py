@@ -399,6 +399,29 @@ async def send_gallery(update: Update, context: ContextTypes.DEFAULT_TYPE, page:
         logger.error(f"Gallery error: {e}")
         await safe_send(update, context, "Ошибка при загрузке фото.")
 
+async def send_notification(context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None):
+    """Отправляет уведомление в чат уведомлений или админу."""
+    try:
+        await context.bot.send_message(
+            chat_id=NOTIFICATION_CHAT_ID,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        print(f"Error sending notification to {NOTIFICATION_CHAT_ID}: {e}")
+        # Если не удалось отправить в группу, пробуем отправить админу напрямую (если это не один и тот же чат)
+        if NOTIFICATION_CHAT_ID != ADMIN_ID:
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=f"⚠️ <b>Ошибка уведомления в группу:</b> {e}\n\n{text}",
+                    reply_markup=reply_markup,
+                    parse_mode="HTML"
+                )
+            except Exception as e2:
+                print(f"Error sending emergency notification to admin: {e2}")
+
 # --- KEYBOARDS ---
 
 def get_main_menu_keyboard(user_id: int):
@@ -694,7 +717,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             admin_msg += f"🔗 <a href='tg://user?id={user_id}'>Открыть профиль</a>"
             
-        await context.bot.send_message(chat_id=NOTIFICATION_CHAT_ID, text=admin_msg, parse_mode="HTML")
+        await send_notification(context, admin_msg)
         return
 
     elif mode == "await_comment":
@@ -965,7 +988,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
              InlineKeyboardButton("❌ Отклонить", callback_data=f"adm_rejc_{b_id}")],
             [InlineKeyboardButton("💬 Написать клиенту", callback_data=f"adm_msg_{user_id}")]
         ])
-        await context.bot.send_message(chat_id=NOTIFICATION_CHAT_ID, text=admin_text, reply_markup=kb, parse_mode="HTML")
+        await send_notification(context, admin_text, reply_markup=kb)
         context.user_data.clear()
 
     elif data.startswith("gal_"):
@@ -1067,7 +1090,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💅 Услуга: {booking[2]}\n"
             f"📅 Дата: {f_dt}"
         )
-        await context.bot.send_message(chat_id=NOTIFICATION_CHAT_ID, text=admin_cancel_msg, parse_mode="HTML")
+        await send_notification(context, admin_cancel_msg)
 
     elif data == "add_review":
         context.user_data["mode"] = "await_review"
@@ -1132,6 +1155,8 @@ def main():
         return
 
     db_init()
+    
+    print(f"Bot started. Admin ID: {ADMIN_ID}, Notification Chat ID: {NOTIFICATION_CHAT_ID}")
     
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
