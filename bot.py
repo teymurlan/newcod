@@ -1,4 +1,5 @@
 import os
+import sys
 import sqlite3
 import asyncio
 import logging
@@ -31,8 +32,22 @@ from telegram.error import BadRequest
 
 # --- CONFIGURATION ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-NOTIFICATION_CHAT_ID = int(os.getenv("NOTIFICATION_CHAT_ID", str(ADMIN_ID)))
+if not BOT_TOKEN:
+    print("CRITICAL ERROR: BOT_TOKEN is not set!")
+    sys.exit(1)
+
+def get_env_int(name, default):
+    val = os.getenv(name, "")
+    if not val or not val.strip():
+        return int(default)
+    try:
+        return int(val.strip())
+    except ValueError:
+        print(f"WARNING: Invalid value for {name}: '{val}'. Using default: {default}")
+        return int(default)
+
+ADMIN_ID = get_env_int("ADMIN_ID", "0")
+NOTIFICATION_CHAT_ID = get_env_int("NOTIFICATION_CHAT_ID", str(ADMIN_ID))
 TZ_NAME = os.getenv("TZ", "Europe/Moscow")
 AUTO_CLEAN = os.getenv("AUTO_CLEAN", "1") == "1"
 SALON_TITLE = os.getenv("SALON_TITLE", "Beauty Lounge")
