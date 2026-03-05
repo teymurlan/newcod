@@ -32,6 +32,7 @@ from telegram.error import BadRequest
 # --- CONFIGURATION ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+NOTIFICATION_CHAT_ID = int(os.getenv("NOTIFICATION_CHAT_ID", str(ADMIN_ID)))
 TZ_NAME = os.getenv("TZ", "Europe/Moscow")
 AUTO_CLEAN = os.getenv("AUTO_CLEAN", "1") == "1"
 SALON_TITLE = os.getenv("SALON_TITLE", "Beauty Lounge")
@@ -90,9 +91,14 @@ def db_init():
             user_id INTEGER PRIMARY KEY,
             name TEXT,
             phone TEXT,
+            username TEXT,
             created_at TEXT
         )
     """)
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN username TEXT")
+    except:
+        pass
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS bookings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -139,12 +145,12 @@ def db_get_user(user_id: int):
     conn.close()
     return user
 
-def db_save_user(user_id: int, name: str, phone: str):
+def db_save_user(user_id: int, name: str, phone: str, username: str = None):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     now = datetime.now(MOSCOW_TZ).isoformat()
-    cursor.execute("INSERT OR REPLACE INTO users (user_id, name, phone, created_at) VALUES (?, ?, ?, ?)",
-                   (user_id, name, phone, now))
+    cursor.execute("INSERT OR REPLACE INTO users (user_id, name, phone, username, created_at) VALUES (?, ?, ?, ?, ?)",
+                   (user_id, name, phone, username, now))
     conn.commit()
     conn.close()
 
@@ -493,7 +499,7 @@ def get_confirm_keyboard():
     keyboard = [
         [InlineKeyboardButton("✅ Подтвердить", callback_data="confirm_booking")],
         [InlineKeyboardButton("✏️ Комментарий", callback_data="add_comment")],
-        [InlineKeyboardButton("❌ Отменить", callback_data="to_menu")]
+        [InlineKeyboardButton("❌ Отказаться", callback_data="cancel_booking_step")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -671,9 +677,24 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         name = context.user_data.get("reg_name", update.effective_user.first_name)
-        db_save_user(user_id, name, clean_phone)
+        username = update.effective_user.username
+        db_save_user(user_id, name, clean_phone, username)
         context.user_data["mode"] = None
         await safe_send(update, context, f"✅ Регистрация завершена!\nПриятно познакомиться, {name}.", reply_markup=get_main_menu_keyboard(user_id))
+        
+        # Уведомление админу о новом пользователе
+        admin_msg = (
+            f"👤 <b>Новый пользователь зарегистрирован!</b>\n\n"
+            f"Имя: {name}\n"
+            f"Телефон: {clean_phone}\n"
+            f"Username: @{username if username else 'отсутствует'}\n"
+        )
+        if username:
+            admin_msg += f"🔗 <a href='https://t.me/{username}'>Открыть чат</a>"
+        else:
+            admin_msg += f"🔗 <a href='tg://user?id={user_id}'>Открыть профиль</a>"
+            
+        await context.bot.send_message(chat_id=NOTIFICATION_CHAT_ID, text=admin_msg, parse_mode="HTML")
         return
 
     elif mode == "await_comment":
@@ -831,6 +852,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["mode"] = None
         await safe_send(update, context, "Главное меню:", reply_markup=get_main_menu_keyboard(user_id))
     
+    elif data == "cancel_booking_step":
+        context.user_data.clear()
+        await query.edit_message_text("❌ Вы отказались от записи. Если передумаете — мы всегда рады вам! 😊")
+        await safe_send(update, context, "Главное меню:", reply_markup=get_main_menu_keyboard(user_id))
+    
     elif data == "book_start":
         await query.edit_message_text("Выберите услугу:", reply_markup=get_services_keyboard())
     
@@ -914,14 +940,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = f"✅ Запись создана! Ожидайте подтверждения мастера.\n\n💰 К оплате: <b>{final_price} ₽</b>"
         if applied_discount:
             msg += "\n🎁 Скидка 7% на первый визит применена!"
-        await safe_send(update, context, msg)
+        
+        kb_cancel = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить запись", callback_data=f"cancel_b_{b_id}")]])
+        await safe_send(update, context, msg, reply_markup=kb_cancel)
         
         user = db_get_user(user_id)
         f_dt = format_dt(context.user_data.get('b_date'), context.user_data.get('b_time'))
+        
+        user_link = f"@{user[3]}" if user[3] else f"<a href='tg://user?id={user_id}'>{user[1]}</a>"
+        
         admin_text = (
             f"<b>🆕 Новая запись!</b>\n"
             f"{'🎁 АКЦИЯ: ПЕРВЫЙ ВИЗИТ (-7%)' if applied_discount else ''}\n\n"
-            f"👤 Клиент: {user[1]} ({user[2]})\n"
+            f"👤 Клиент: {user[1]} ({user[2]}) {user_link}\n"
             f"💅 Услуга: {service}\n"
             f"📅 Дата и время: {f_dt}\n"
             f"💰 Сумма: {final_price} ₽\n"
@@ -934,7 +965,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
              InlineKeyboardButton("❌ Отклонить", callback_data=f"adm_rejc_{b_id}")],
             [InlineKeyboardButton("💬 Написать клиенту", callback_data=f"adm_msg_{user_id}")]
         ])
-        await context.bot.send_message(chat_id=ADMIN_ID, text=admin_text, reply_markup=kb, parse_mode="HTML")
+        await context.bot.send_message(chat_id=NOTIFICATION_CHAT_ID, text=admin_text, reply_markup=kb, parse_mode="HTML")
         context.user_data.clear()
 
     elif data.startswith("gal_"):
@@ -997,7 +1028,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📍 <b>Как нас найти:</b>\n{ADDRESS_TEXT}\n"
             f"🔗 <a href='{MAPS_URL}'>Открыть на картах</a>"
         )
-        await context.bot.send_message(chat_id=booking[1], text=conf_msg, parse_mode="HTML")
+        kb_user = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить запись", callback_data=f"cancel_b_{b_id}")]])
+        await context.bot.send_message(chat_id=booking[1], text=conf_msg, reply_markup=kb_user, parse_mode="HTML")
         
     elif data.startswith("adm_rejc_"):
         b_id = int(data.split("_")[2])
@@ -1020,7 +1052,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Запись отменена.")
         user = db_get_user(user_id)
         f_dt = format_dt(booking[3], booking[4])
-        await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Клиент {user[1]} отменил запись на {f_dt}.")
+        
+        user_link = f"@{user[3]}" if user[3] else f"<a href='tg://user?id={user_id}'>{user[1]}</a>"
+        
+        admin_cancel_msg = (
+            f"⚠️ <b>Клиент отменил запись!</b>\n\n"
+            f"👤 Клиент: {user[1]} ({user[2]}) {user_link}\n"
+            f"💅 Услуга: {booking[2]}\n"
+            f"📅 Дата: {f_dt}"
+        )
+        await context.bot.send_message(chat_id=NOTIFICATION_CHAT_ID, text=admin_cancel_msg, parse_mode="HTML")
 
     elif data == "add_review":
         context.user_data["mode"] = "await_review"
