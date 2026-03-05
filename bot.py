@@ -1088,8 +1088,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📍 <b>Как нас найти:</b>\n{ADDRESS_TEXT}\n"
             f"🔗 <a href='{MAPS_URL}'>Открыть на картах</a>"
         )
-        kb_user = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить запись", callback_data=f"cancel_b_{b_id}")]])
-        await context.bot.send_message(chat_id=booking[1], text=conf_msg, reply_markup=kb_user, parse_mode="HTML")
+        await context.bot.send_message(chat_id=booking[1], text=conf_msg, parse_mode="HTML")
         
     elif data.startswith("adm_rejc_"):
         b_id = int(data.split("_")[2])
