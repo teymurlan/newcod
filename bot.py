@@ -998,11 +998,21 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         b_time = context.user_data.get("b_time")
         service = context.user_data.get("b_service")
         
+        if not b_date or not b_time:
+            await query.answer("⚠️ Сессия устарела. Начните запись заново.", show_alert=True)
+            return
+
+        # Сразу убираем кнопки, чтобы нельзя было нажать дважды
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except:
+            pass
+
         # Проверка на занятость (защита от одновременных кликов)
         booked_times = db_get_booked_times(b_date)
         if b_time in booked_times:
-            await query.answer("Извините, это время уже занято кем-то другим. Пожалуйста, выберите другое время.", show_alert=True)
-            await query.edit_message_text("Выберите другое время:", reply_markup=get_time_keyboard(b_date))
+            await query.answer("⚠️ Это время уже занято.", show_alert=True)
+            await query.edit_message_text("😔 К сожалению, это время уже занято. Пожалуйста, выберите другое:", reply_markup=get_time_keyboard(b_date))
             return
 
         is_first = not db_has_previous_bookings(user_id)
@@ -1023,7 +1033,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         
         if b_id is None:
-            await query.answer("⚠️ К сожалению, это время уже занято.", show_alert=True)
+            await query.answer("⚠️ К сожалению, это время только что заняли.", show_alert=True)
             await query.edit_message_text(
                 "😔 К сожалению, это время только что заняли.\n\n"
                 "Пожалуйста, выберите другое время или другой день:", 
@@ -1031,15 +1041,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         
-        msg = f"✅ Запись создана! Ожидайте подтверждения мастера.\n\n💰 К оплате: <b>{final_price} ₽</b>"
+        # Обновляем сообщение резюме, превращая его в сообщение об успехе
+        success_msg = f"\n\n✅ <b>Запись создана!</b>\nОжидайте подтверждения мастера.\n💰 К оплате: <b>{final_price} ₽</b>"
         if applied_discount:
-            msg += "\n🎁 Скидка 7% на первый визит применена!"
+            success_msg += "\n🎁 Скидка 7% на первый визит применена!"
         
-        kb_cancel = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить запись", callback_data=f"cancel_b_{b_id}")]])
-        await safe_send(update, context, msg, reply_markup=kb_cancel)
+        success_msg += "\n\n📍 Управлять записями можно в разделе <b>Мои записи</b>."
+        
+        await query.edit_message_text(f"{query.message.text_html}{success_msg}", parse_mode="HTML")
         
         user = db_get_user(user_id)
-        f_dt = format_dt(context.user_data.get('b_date'), context.user_data.get('b_time'))
+        f_dt = format_dt(b_date, b_time)
         
         user_link = f"@{user[3]}" if user[3] else f"<a href='tg://user?id={user_id}'>{user[1]}</a>"
         
