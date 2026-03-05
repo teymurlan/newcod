@@ -38,6 +38,21 @@ SALON_TITLE = os.getenv("SALON_TITLE", "Beauty Lounge")
 MAPS_URL = os.getenv("MAPS_URL", "https://yandex.ru/maps/")
 ADDRESS_TEXT = os.getenv("ADDRESS_TEXT", "Дальневосточный проспект 19 к 1, кв 69, этаж 10")
 
+SERVICE_PRICES = {
+    "Маникюр с покрытием": 2500,
+    "Маникюр без покрытия": 1300,
+    "Маникюр + дизайн": 3000,
+    "Педикюр с покрытием": 2800,
+    "Педикюр без покрытия": 2000,
+    "Педикюр (пальчики)": 1800,
+    "Обработка стоп": 1500,
+    "Наращивание": 3500,
+    "Коррекция": 2800
+}
+
+DISCOUNT_PERCENT = 7
+DISCOUNT_END_DATE = date(2026, 4, 4)
+
 MOSCOW_TZ = pytz.timezone(TZ_NAME)
 
 FAQ_DATA = [
@@ -281,16 +296,9 @@ def db_get_stats():
     completed_count = len(completed_bookings)
     
     # Расчет выручки
-    price_map = {
-        "Маникюр": 2500,
-        "Педикюр": 2800,
-        "Наращивание": 3500,
-        "Коррекция": 2800
-    }
-    
     total_revenue = 0
     for (service,) in completed_bookings:
-        total_revenue += price_map.get(service, 2500)
+        total_revenue += SERVICE_PRICES.get(service, 2500)
         
     conn.close()
     return active_count, completed_count, total_revenue
@@ -400,8 +408,12 @@ def get_main_menu_keyboard(user_id: int):
 
 def get_services_keyboard():
     keyboard = [
-        [InlineKeyboardButton("💅 Маникюр", callback_data="svc_manicure"),
-         InlineKeyboardButton("🦶 Педикюр", callback_data="svc_pedicure")],
+        [InlineKeyboardButton("💅 Маникюр + покрытие", callback_data="svc_man_full")],
+        [InlineKeyboardButton("✨ Маникюр без покрытия", callback_data="svc_man_simple"),
+         InlineKeyboardButton("🎨 Маникюр + дизайн", callback_data="svc_man_design")],
+        [InlineKeyboardButton("💖 Педикюр + покрытие", callback_data="svc_ped_full")],
+        [InlineKeyboardButton("🦶 Педикюр без покрытия", callback_data="svc_ped_simple"),
+         InlineKeyboardButton("👣 Педикюр (пальчики)", callback_data="svc_ped_fingers")],
         [InlineKeyboardButton("✨ Наращивание", callback_data="svc_ext"),
          InlineKeyboardButton("🔧 Коррекция", callback_data="svc_corr")],
         [InlineKeyboardButton("🏠 В меню", callback_data="to_menu")]
@@ -495,6 +507,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👋 Добро пожаловать в <b>{SALON_TITLE}</b>!\n\n"
         "Я ваш личный помощник для записи на процедуры.\n"
         "Здесь вы можете выбрать удобное время, посмотреть цены и оставить отзыв.\n\n"
+        "🎁 <b>Акция!</b> Скидка <b>7%</b> на первую запись через бота!\n"
+        "<i>(Акция действует 1 раз до 04.04.2026)</i>\n\n"
     )
     
     if not user:
@@ -557,22 +571,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_send(update, context, "Выберите услугу:", reply_markup=get_services_keyboard())
             return
         elif norm == "prices":
-            prices_text = (
-                "<b>💰 Наши цены:</b>\n\n"
-                "✨ Маникюр без покрытия — 1300 ₽\n"
-                "💅 Маникюр с покрытием — 2500 ₽\n"
-                "🎨 Маникюр с покрытием + дизайн — 3000 ₽\n\n"
-                "🦶 Педикюр без покрытия — 2000 ₽\n"
-                "💖 Педикюр + покрытие — 2800 ₽\n"
-                "👣 Педикюр пальчики — 1800 ₽\n"
-                "🦶 Обработка стоп — 1500 ₽\n\n"
-                "✨ Наращивание ногтей — от 3500 ₽\n"
-                "🔧 Коррекция ногтей — от 2800 ₽\n"
-                "🎨 Дизайн — от 50 ₽ / ноготь\n\n"
-                "<i>Нажмите кнопку ниже для записи</i>"
-            )
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("📅 Записаться", callback_data="book_start")]])
-            await safe_send(update, context, prices_text, reply_markup=kb)
+            await prices_command(update, context)
             return
         elif norm == "about":
             about_text = (
@@ -675,6 +674,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_save_user(user_id, name, clean_phone)
         context.user_data["mode"] = None
         await safe_send(update, context, f"✅ Регистрация завершена!\nПриятно познакомиться, {name}.", reply_markup=get_main_menu_keyboard(user_id))
+        return
 
     elif mode == "await_comment":
         context.user_data["b_comment"] = text
@@ -706,6 +706,35 @@ async def recommendation_command(update: Update, context: ContextTypes.DEFAULT_T
         "5. Не снимайте покрытие самостоятельно!"
     )
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="to_menu")]])
+    await safe_send(update, context, text, reply_markup=kb)
+
+async def prices_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    prices_text = (
+        "<b>💰 Наши цены:</b>\n\n"
+        "✨ Маникюр без покрытия — 1300 ₽\n"
+        "💅 Маникюр с покрытием — 2500 ₽\n"
+        "🎨 Маникюр с покрытием + дизайн — 3000 ₽\n\n"
+        "🦶 Педикюр без покрытия — 2000 ₽\n"
+        "💖 Педикюр + покрытие — 2800 ₽\n"
+        "👣 Педикюр пальчики — 1800 ₽\n"
+        "🦶 Обработка стоп — 1500 ₽\n\n"
+        "✨ Наращивание ногтей — от 3500 ₽\n"
+        "🔧 Коррекция ногтей — от 2800 ₽\n"
+        "🎨 Дизайн — от 50 ₽ / ноготь\n\n"
+        "<i>Нажмите кнопку ниже для записи</i>"
+    )
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📅 Записаться", callback_data="book_start")]])
+    await safe_send(update, context, prices_text, reply_markup=kb)
+
+async def faq_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = "<b>❓ Часто задаваемые вопросы:</b>\n\n"
+    for i, (q, a) in enumerate(FAQ_DATA, 1):
+        text += f"<b>{i}. {q}</b>\n— {a}\n\n"
+    
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✍️ Написать мастеру", url="https://t.me/teymurlannn")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="to_menu")]
+    ])
     await safe_send(update, context, text, reply_markup=kb)
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -753,18 +782,30 @@ async def show_booking_summary(update: Update, context: ContextTypes.DEFAULT_TYP
     user = db_get_user(user_id)
     
     is_first = not db_has_previous_bookings(user_id)
+    now_date = datetime.now(MOSCOW_TZ).date()
+    can_apply_discount = is_first and now_date <= DISCOUNT_END_DATE
+    
+    service = data.get('b_service')
+    base_price = SERVICE_PRICES.get(service, 0)
+    final_price = base_price
+    
     f_dt = format_dt(data.get('b_date'), data.get('b_time'))
     
     summary = (
         "<b>🏁 Подтверждение записи:</b>\n\n"
-        f"💅 Услуга: {data.get('b_service')}\n"
+        f"💅 Услуга: {service}\n"
         f"📅 Дата и время: {f_dt}\n"
         f"👤 Имя: {user[1]}\n"
         f"📞 Тел: {user[2]}\n"
     )
     
-    if is_first:
-        summary += "\n🎁 <b>Акция:</b> Ваша первая запись через бота! Скидка <b>7%</b> применена. ✨\n"
+    if can_apply_discount:
+        discount_amount = int(base_price * DISCOUNT_PERCENT / 100)
+        final_price = base_price - discount_amount
+        summary += f"\n💰 Стоимость: <s>{base_price}</s> <b>{final_price} ₽</b> (-7%)\n"
+        summary += "🎁 <b>Акция:</b> Ваша первая запись через бота! ✨\n"
+    else:
+        summary += f"\n💰 Стоимость: <b>{final_price} ₽</b>\n"
         
     if data.get("b_comment"):
         summary += f"\n💬 Комментарий: {data.get('b_comment')}\n"
@@ -797,7 +838,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_gallery(update, context)
     
     elif data.startswith("svc_"):
-        services = {"svc_manicure": "Маникюр", "svc_pedicure": "Педикюр", "svc_ext": "Наращивание", "svc_corr": "Коррекция"}
+        services = {
+            "svc_man_full": "Маникюр с покрытием",
+            "svc_man_simple": "Маникюр без покрытия",
+            "svc_man_design": "Маникюр + дизайн",
+            "svc_ped_full": "Педикюр с покрытием",
+            "svc_ped_simple": "Педикюр без покрытия",
+            "svc_ped_fingers": "Педикюр (пальчики)",
+            "svc_ext": "Наращивание",
+            "svc_corr": "Коррекция"
+        }
         context.user_data["b_service"] = services.get(data)
         now = datetime.now(MOSCOW_TZ)
         await query.edit_message_text("Выберите дату:", reply_markup=get_calendar_keyboard(now.year, now.month))
@@ -830,6 +880,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         b_date = context.user_data.get("b_date")
         b_time = context.user_data.get("b_time")
+        service = context.user_data.get("b_service")
         
         # Проверка на занятость (защита от одновременных кликов)
         booked_times = db_get_booked_times(b_date)
@@ -839,10 +890,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         is_first = not db_has_previous_bookings(user_id)
+        now_date = datetime.now(MOSCOW_TZ).date()
+        applied_discount = is_first and now_date <= DISCOUNT_END_DATE
+        
+        base_price = SERVICE_PRICES.get(service, 0)
+        final_price = base_price
+        if applied_discount:
+            final_price = base_price - int(base_price * DISCOUNT_PERCENT / 100)
         
         b_id = db_save_booking(
             user_id, 
-            context.user_data.get("b_service"),
+            service,
             b_date,
             b_time,
             context.user_data.get("b_comment", "")
@@ -853,19 +911,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Выберите другое время:", reply_markup=get_time_keyboard(b_date))
             return
         
-        msg = "✅ Запись создана! Ожидайте подтверждения мастера."
-        if is_first:
-            msg += "\n\n🎁 Скидка 7% на первый визит зафиксирована!"
+        msg = f"✅ Запись создана! Ожидайте подтверждения мастера.\n\n💰 К оплате: <b>{final_price} ₽</b>"
+        if applied_discount:
+            msg += "\n🎁 Скидка 7% на первый визит применена!"
         await safe_send(update, context, msg)
         
         user = db_get_user(user_id)
         f_dt = format_dt(context.user_data.get('b_date'), context.user_data.get('b_time'))
         admin_text = (
             f"<b>🆕 Новая запись!</b>\n"
-            f"{'🎁 АКЦИЯ: ПЕРВЫЙ ВИЗИТ (-7%)' if is_first else ''}\n\n"
+            f"{'🎁 АКЦИЯ: ПЕРВЫЙ ВИЗИТ (-7%)' if applied_discount else ''}\n\n"
             f"👤 Клиент: {user[1]} ({user[2]})\n"
-            f"💅 Услуга: {context.user_data.get('b_service')}\n"
+            f"💅 Услуга: {service}\n"
             f"📅 Дата и время: {f_dt}\n"
+            f"💰 Сумма: {final_price} ₽\n"
         )
         if context.user_data.get("b_comment"):
             admin_text += f"💬 Комментарий: {context.user_data.get('b_comment')}\n"
@@ -1020,10 +1079,12 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("menu", menu_command))
     application.add_handler(CommandHandler("recommendation", recommendation_command))
+    application.add_handler(CommandHandler("faq", faq_command))
+    application.add_handler(CommandHandler("prices", prices_command))
     application.add_handler(CallbackQueryHandler(on_callback))
     application.add_handler(MessageHandler(filters.CONTACT, on_contact))
     application.add_handler(MessageHandler(filters.PHOTO, on_photo))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    application.add_handler(MessageHandler(filters.TEXT, on_text))
 
     job_queue = application.job_queue
     job_queue.run_repeating(reminder_job, interval=600, first=10)
