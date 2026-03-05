@@ -793,7 +793,7 @@ async def show_gallery_admin(update: Update, context: ContextTypes.DEFAULT_TYPE)
     kb = [
         [InlineKeyboardButton("➕ Добавить фото", callback_data="adm_gal_add")],
         [InlineKeyboardButton("🗑 Удалить последнее", callback_data="adm_gal_del")],
-        [InlineKeyboardButton("⬅️ Назад в админку", callback_data="admin_back")]
+        [InlineKeyboardButton("⬅️ Назад в админку", callback_data="adm_back")]
     ]
     await safe_send(update, context, text, reply_markup=InlineKeyboardMarkup(kb))
 
@@ -972,7 +972,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         page = int(data.split("_")[1])
         await send_gallery(update, context, page)
         
-    elif data.startswith("adm_view_"):
+    if data.startswith("adm_"):
+        # Разрешаем кликать админу ИЛИ любому участнику в чате уведомлений
+        if user_id != ADMIN_ID and query.message.chat_id != NOTIFICATION_CHAT_ID:
+            await query.answer("❌ У вас нет прав администратора.", show_alert=True)
+            return
+
+    if data.startswith("adm_view_"):
         parts = data.split("_")
         is_past = "past" in parts
         days = int(parts[-1])
@@ -1001,7 +1007,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 kb.append([InlineKeyboardButton("💬 Написать", callback_data=f"adm_msg_{b[1]} text")])
                 await safe_send(update, context, text, reply_markup=InlineKeyboardMarkup(kb))
 
-    elif data == "admin_back":
+    elif data == "adm_back":
         await show_admin_filters(update, context)
 
     elif data == "adm_gallery":
@@ -1108,6 +1114,18 @@ async def post_init(application: Application):
         ("prices", "Цены на услуги")
     ])
 
+async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для получения ID текущего чата."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    await update.message.reply_text(
+        f"🆔 <b>Информация об ID:</b>\n\n"
+        f"Этот чат (Chat ID): <code>{chat_id}</code>\n"
+        f"Ваш ID (User ID): <code>{user_id}</code>\n\n"
+        f"Скопируйте Chat ID и добавьте его в переменную <code>NOTIFICATION_CHAT_ID</code>.",
+        parse_mode="HTML"
+    )
+
 def main():
     if not BOT_TOKEN:
         print("Error: BOT_TOKEN not found.")
@@ -1118,6 +1136,7 @@ def main():
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("id", id_command))
     application.add_handler(CommandHandler("menu", menu_command))
     application.add_handler(CommandHandler("recommendation", recommendation_command))
     application.add_handler(CommandHandler("faq", faq_command))
