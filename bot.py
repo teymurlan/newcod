@@ -42,15 +42,10 @@ MOSCOW_TZ = pytz.timezone(TZ_NAME)
 
 FAQ_DATA = [
     ("Сколько держится покрытие?", "В среднем 3-4 недели. Мы даем гарантию 7 дней на любые отслойки."),
-    ("Как подготовиться к педикюру?", "Специальная подготовка не нужна, просто приходите в удобной обуви."),
-    ("Есть ли у вас мужской маникюр?", "Да, конечно! Мы делаем качественный гигиенический маникюр для мужчин."),
     ("Стерильны ли инструменты?", "Абсолютно. Инструменты проходят 3 этапа стерилизации, включая сухожар. Крафт-пакет вскрывается при вас."),
-    ("Можно ли прийти с ребенком?", "Да, если ребенок может посидеть спокойно, у нас есть зона ожидания."),
-    ("Как отменить запись?", "Вы можете сделать это через раздел 'Мои записи' не позднее чем за 24 часа."),
-    ("Делаете ли вы наращивание?", "Да, мы делаем наращивание на формы и гелевые типсы."),
     ("Сколько времени занимает процедура?", "Маникюр с покрытием занимает 1.5 - 2 часа в зависимости от сложности."),
-    ("Есть ли парковка?", "Да, рядом с домом всегда есть свободные места для парковки."),
-    ("Как оплатить?", "Мы принимаем наличные и переводы на карту.")
+    ("Как отменить запись?", "Вы можете сделать это через раздел 'Мои записи' не позднее чем за 24 часа."),
+    ("Есть ли парковка?", "Да, рядом с домом всегда есть свободные места для парковки.")
 ]
 
 PHOTO_URLS = [
@@ -271,6 +266,35 @@ def db_get_filtered_bookings(days: int, past: bool = False):
     conn.close()
     return bookings
 
+def db_get_stats():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    today = datetime.now(MOSCOW_TZ).date().isoformat()
+    
+    # Активные (будущие или сегодняшние подтвержденные)
+    cursor.execute("SELECT COUNT(*) FROM bookings WHERE status = 'confirmed' AND date >= ?", (today,))
+    active_count = cursor.fetchone()[0]
+    
+    # Завершенные (прошедшие подтвержденные)
+    cursor.execute("SELECT service FROM bookings WHERE status = 'confirmed' AND date < ?", (today,))
+    completed_bookings = cursor.fetchall()
+    completed_count = len(completed_bookings)
+    
+    # Расчет выручки
+    price_map = {
+        "Маникюр": 2500,
+        "Педикюр": 2800,
+        "Наращивание": 3500,
+        "Коррекция": 2800
+    }
+    
+    total_revenue = 0
+    for (service,) in completed_bookings:
+        total_revenue += price_map.get(service, 2500)
+        
+    conn.close()
+    return active_count, completed_count, total_revenue
+
 # --- HELPERS ---
 
 def format_dt(date_str: str, time_str: str = "") -> str:
@@ -294,6 +318,7 @@ def normalize_button(text: str) -> str:
     if "отзывы" in t: return "reviews"
     if "админ" in t: return "admin"
     if "вопросы" in t or "faq" in t: return "faq"
+    if "рекомендация" in t: return "recommendation"
     if "меню" in t: return "menu"
     if "назад" in t: return "back"
     
@@ -622,7 +647,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
             
         elif norm == "menu":
-            await safe_send(update, context, "Главное меню:", reply_markup=get_main_menu_keyboard(user_id))
+            await menu_command(update, context)
+            return
+        elif norm == "recommendation":
+            await recommendation_command(update, context)
             return
 
     # 2. Handle Input Modes
@@ -668,8 +696,37 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await safe_send(update, context, "❌ Не удалось отправить сообщение.")
         context.user_data["mode"] = None
 
+async def recommendation_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "<b>💅 Рекомендации по уходу:</b>\n\n"
+        "1. Используйте масло для кутикулы ежедневно.\n"
+        "2. Надевайте перчатки при работе с бытовой химией.\n"
+        "3. Не используйте ногти как инструмент (не открывайте ими банки).\n"
+        "4. Обновляйте покрытие каждые 3-4 недели.\n"
+        "5. Не снимайте покрытие самостоятельно!"
+    )
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="to_menu")]])
+    await safe_send(update, context, text, reply_markup=kb)
+
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = db_get_user(user_id)
+    if user:
+        await safe_send(update, context, "Главное меню:", reply_markup=get_main_menu_keyboard(user_id))
+    else:
+        await start(update, context)
+
 async def show_admin_filters(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = "🛠 <b>Админ-панель</b>\n\nВыберите период для просмотра записей или управление контентом:"
+    active, completed, revenue = db_get_stats()
+    
+    text = (
+        "🛠 <b>Админ-панель</b>\n\n"
+        "📊 <b>Статистика:</b>\n"
+        f"✅ Активные записи: {active}\n"
+        f"🏁 Завершенные: {completed}\n"
+        f"💰 Выручка (заверш.): {revenue} ₽\n\n"
+        "Выберите период для просмотра записей или управление контентом:"
+    )
     kb = [
         [InlineKeyboardButton("📅 На 7 дней", callback_data="adm_view_7"),
          InlineKeyboardButton("📅 На 14 дней", callback_data="adm_view_14")],
@@ -942,6 +999,15 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
 
 # --- MAIN ---
 
+async def post_init(application: Application):
+    await application.bot.set_my_commands([
+        ("start", "Запустить бота"),
+        ("menu", "Главное меню"),
+        ("recommendation", "Рекомендации по уходу"),
+        ("faq", "Вопросы и ответы"),
+        ("prices", "Цены на услуги")
+    ])
+
 def main():
     if not BOT_TOKEN:
         print("Error: BOT_TOKEN not found.")
@@ -949,9 +1015,11 @@ def main():
 
     db_init()
     
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler(["menu", "меню"], menu_command))
+    application.add_handler(CommandHandler(["recommendation", "рекомендация"], recommendation_command))
     application.add_handler(CallbackQueryHandler(on_callback))
     application.add_handler(MessageHandler(filters.CONTACT, on_contact))
     application.add_handler(MessageHandler(filters.PHOTO, on_photo))
