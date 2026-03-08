@@ -346,33 +346,36 @@ def normalize_button(text: str) -> str:
     if not text: return None
     t = text.lower().strip()
     
-    # Логируем для отладки, если кнопки не срабатывают
-    logger.debug(f"Normalizing text: '{t}'")
+    # Логируем для отладки
+    logger.info(f"Normalizing text: '{t}'")
     
-    # Прямое сопоставление (самое надежное)
-    if "записаться" in t: return "book"
-    if "цены" in t: return "prices"
-    if "обо мне" in t: return "about"
-    if "как нас найти" in t or "найти" in t: return "location"
-    if "мои записи" in t: return "my_bookings"
-    if "отзывы" in t: return "reviews"
-    if "админ" in t: return "admin"
-    if "вопросы" in t or "faq" in t or "ответы" in t: return "faq"
-    if "рекомендация" in t: return "recommendation"
-    if "меню" in t: return "menu"
+    # 1. Прямое сопоставление ключевых слов (самое надежное)
+    if any(k in t for k in ["записаться", "запись на"]): return "book"
+    if any(k in t for k in ["цены", "прайс", "стоимость"]): return "prices"
+    if any(k in t for k in ["обо мне", "мастер", "кто ты"]): return "about"
+    if any(k in t for k in ["найти", "адрес", "локация", "где вы"]): return "location"
+    if any(k in t for k in ["мои записи", "моя запись", "записи"]): 
+        # Важно: "записи" может быть в "мои записи", но мы проверяем это после "записаться"
+        if "записаться" not in t:
+            return "my_bookings"
+    if any(k in t for k in ["отзывы", "фидбек", "мнения"]): return "reviews"
+    if any(k in t for k in ["админ", "поддержка", "связь"]): return "admin"
+    if any(k in t for k in ["вопросы", "ответы", "faq", "помощь", "инфо"]): return "faq"
+    if any(k in t for k in ["рекомендация", "советы", "уход"]): return "recommendation"
+    if any(k in t for k in ["меню", "главная", "старт"]): return "menu"
     if "назад" in t: return "back"
     
-    # Дополнительная очистка от спецсимволов и эмодзи
+    # 2. Очистка от спецсимволов и эмодзи и повторная проверка
     clean = re.sub(r'[^\w\s]', '', t).strip()
     if clean:
-        if "записаться" in clean: return "book"
-        if "цены" in clean: return "prices"
+        if any(k in clean for k in ["записаться", "запись"]): return "book"
+        if any(k in clean for k in ["цены", "прайс"]): return "prices"
         if "обо мне" in clean: return "about"
-        if "найти" in clean: return "location"
-        if "мои записи" in clean: return "my_bookings"
+        if any(k in clean for k in ["найти", "адрес"]): return "location"
+        if "мои записи" in clean or "моизаписи" in clean: return "my_bookings"
         if "отзывы" in clean: return "reviews"
         if "админ" in clean: return "admin"
-        if "вопросы" in clean or "ответы" in clean: return "faq"
+        if any(k in clean for k in ["вопросы", "ответы", "faq"]): return "faq"
         if "рекомендация" in clean: return "recommendation"
         if "меню" in clean: return "menu"
         if "назад" in clean: return "back"
@@ -664,6 +667,18 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         norm = normalize_button(text)
+        
+        # Fallback для кнопок, если normalize_button не сработал
+        if not norm:
+            t_low = text.lower()
+            if "мои записи" in t_low: norm = "my_bookings"
+            elif "вопросы" in t_low or "ответы" in t_low: norm = "faq"
+            elif "записаться" in t_low: norm = "book"
+            elif "цены" in t_low: norm = "prices"
+            elif "отзывы" in t_low: norm = "reviews"
+            elif "обо мне" in t_low: norm = "about"
+            elif "найти" in t_low: norm = "location"
+
         mode = context.user_data.get("mode")
         
         await track_message(context, chat.id, update.message.message_id)
@@ -711,27 +726,31 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await safe_send(update, context, loc_text, reply_markup=kb)
                 return
             elif norm == "my_bookings":
-                bookings = db_get_user_bookings(user_id)
-                if not bookings:
-                    await safe_send(update, context, "У вас пока нет активных записей.")
-                else:
-                    await safe_send(update, context, "<b>📋 Ваши активные записи:</b>")
-                    for b in bookings:
-                        status_emoji = "⏳" if b[6] == "pending" else "✅"
-                        f_dt = format_dt(b[3], b[4])
-                        b_text = (
-                            f"{status_emoji} <b>{b[2]}</b>\n"
-                            f"📅 {f_dt}\n"
-                            f"Статус: {'Ожидает подтверждения' if b[6] == 'pending' else 'Подтверждена'}\n"
-                        )
-                        kb = InlineKeyboardMarkup([
-                            [InlineKeyboardButton("❌ Отменить запись", callback_data=f"cancel_b_{b[0]}")],
-                            [
-                                InlineKeyboardButton("📱 SMS", url=f"sms:{MASTER_PHONE}"),
-                                InlineKeyboardButton("💬 Telegram", url=f"https://t.me/{MASTER_TG}")
-                            ]
-                        ])
-                        await safe_send(update, context, b_text, reply_markup=kb)
+                try:
+                    bookings = db_get_user_bookings(user_id)
+                    if not bookings:
+                        await safe_send(update, context, "У вас пока нет активных записей.")
+                    else:
+                        await safe_send(update, context, "<b>📋 Ваши активные записи:</b>")
+                        for b in bookings:
+                            status_emoji = "⏳" if b[6] == "pending" else "✅"
+                            f_dt = format_dt(b[3], b[4])
+                            b_text = (
+                                f"{status_emoji} <b>{b[2]}</b>\n"
+                                f"📅 {f_dt}\n"
+                                f"Статус: {'Ожидает подтверждения' if b[6] == 'pending' else 'Подтверждена'}\n"
+                            )
+                            kb = InlineKeyboardMarkup([
+                                [InlineKeyboardButton("❌ Отменить запись", callback_data=f"cancel_b_{b[0]}")],
+                                [
+                                    InlineKeyboardButton("📱 SMS", url=f"sms:{MASTER_PHONE}"),
+                                    InlineKeyboardButton("💬 Telegram", url=f"https://t.me/{MASTER_TG}")
+                                ]
+                            ])
+                            await safe_send(update, context, b_text, reply_markup=kb)
+                except Exception as e:
+                    logger.error(f"Error in my_bookings: {e}", exc_info=True)
+                    await safe_send(update, context, "❌ Произошла ошибка при получении записей. Попробуйте позже.")
                 return
             elif norm == "reviews":
                 reviews = db_get_latest_reviews()
@@ -817,12 +836,20 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # 3. Анти-спам
         if not norm and not mode:
-            try: await update.message.delete()
-            except: pass
+            # Если текст похож на кнопку, но не распознан - даем подсказку
+            t_low = text.lower()
+            if any(k in t_low for k in ["запис", "вопрос", "ответ", "цен", "отзыв", "меню"]):
+                await safe_send(update, context, "🤖 Я не совсем понял команду. Пожалуйста, используйте кнопки меню ниже.")
+            else:
+                try: await update.message.delete()
+                except: pass
 
     except Exception as e:
         logger.error(f"Error in on_text: {e}", exc_info=True)
-        # Опционально: отправить сообщение админу об ошибке
+        try:
+            await safe_send(update, context, "⚠️ Произошла ошибка при обработке сообщения. Пожалуйста, попробуйте еще раз или используйте /start.")
+        except:
+            pass
 
 async def recommendation_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
