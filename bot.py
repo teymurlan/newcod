@@ -744,8 +744,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             kb = InlineKeyboardMarkup([
                                 [InlineKeyboardButton("❌ Отменить запись", callback_data=f"cancel_b_{b[0]}")],
                                 [
-                                    InlineKeyboardButton("📱 SMS", url=f"sms:{MASTER_PHONE}"),
-                                    InlineKeyboardButton("💬 Telegram", url=f"https://t.me/{MASTER_TG}")
+                                    InlineKeyboardButton("💬 Связаться с мастером", url=f"https://t.me/{MASTER_TG}")
                                 ]
                             ])
                             await safe_send(update, context, b_text, reply_markup=kb)
