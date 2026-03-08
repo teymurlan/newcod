@@ -888,8 +888,7 @@ async def faq_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     kb = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📱 SMS", url=f"sms:{MASTER_PHONE}"),
-            InlineKeyboardButton("💬 Telegram", url=f"https://t.me/{MASTER_TG}")
+            InlineKeyboardButton("💬 Связаться с мастером", url=f"https://t.me/{MASTER_TG}")
         ],
         [InlineKeyboardButton("⬅️ Назад", callback_data="to_menu")]
     ])
