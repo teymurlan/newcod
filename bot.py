@@ -123,10 +123,18 @@ def db_init():
             comment TEXT,
             status TEXT,
             created_at TEXT,
-            reminded INTEGER DEFAULT 0,
+            reminded_24h INTEGER DEFAULT 0,
+            reminded_2h INTEGER DEFAULT 0,
             UNIQUE(date, time) ON CONFLICT ABORT
         )
     """)
+    # Migration for old tables
+    try:
+        cursor.execute("ALTER TABLE bookings ADD COLUMN reminded_24h INTEGER DEFAULT 0")
+    except: pass
+    try:
+        cursor.execute("ALTER TABLE bookings ADD COLUMN reminded_2h INTEGER DEFAULT 0")
+    except: pass
     # Добавляем индекс для существующих баз данных
     try:
         cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_bookings_date_time ON bookings(date, time) WHERE status != 'cancelled'")
@@ -345,7 +353,7 @@ def normalize_button(text: str) -> str:
     if "мои записи" in t: return "my_bookings"
     if "отзывы" in t: return "reviews"
     if "админ" in t: return "admin"
-    if "вопросы" in t or "faq" in t: return "faq"
+    if "вопросы" in t or "faq" in t or "ответы" in t: return "faq"
     if "рекомендация" in t: return "recommendation"
     if "меню" in t: return "menu"
     if "назад" in t: return "back"
@@ -692,15 +700,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not bookings:
                 await safe_send(update, context, "У вас пока нет активных записей.")
             else:
+                await safe_send(update, context, "<b>📋 Ваши активные записи:</b>", parse_mode="HTML")
                 for b in bookings:
                     status_emoji = "⏳" if b[6] == "pending" else "✅"
                     f_dt = format_dt(b[3], b[4])
                     b_text = (
-                        f"<b>📋 Запись:</b>\n\n"
-                        f"{status_emoji} {b[2]}\n"
-                        f"📅 {f_dt}\n\n"
-                        f"🔄 <b>Как перенести запись?</b>\n"
-                        f"Для переноса времени, пожалуйста, свяжитесь со мной напрямую через кнопки ниже."
+                        f"{status_emoji} <b>{b[2]}</b>\n"
+                        f"📅 {f_dt}\n"
+                        f"Статус: {'Ожидает подтверждения' if b[6] == 'pending' else 'Подтверждена'}\n"
                     )
                     kb = InlineKeyboardMarkup([
                         [InlineKeyboardButton("❌ Отменить запись", callback_data=f"cancel_b_{b[0]}")],
@@ -730,18 +737,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
             
         elif norm == "faq":
-            text = "<b>❓ Часто задаваемые вопросы:</b>\n\n"
-            for i, (q, a) in enumerate(FAQ_DATA, 1):
-                text += f"<b>{i}. {q}</b>\n— {a}\n\n"
-            
-            kb = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("📱 SMS", url=f"sms:{MASTER_PHONE}"),
-                    InlineKeyboardButton("💬 Telegram", url=f"https://t.me/{MASTER_TG}")
-                ],
-                [InlineKeyboardButton("⬅️ Назад", callback_data="to_menu")]
-            ])
-            await safe_send(update, context, text, reply_markup=kb)
+            await faq_command(update, context)
             return
             
         elif norm == "menu":
@@ -1188,14 +1184,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("❌ Запись уже отменена.")
                 return
                 
-            if booking[6] == "confirmed":
-                # Для подтвержденных записей просто выводим сообщение, не отменяя
-                await query.edit_message_text(
-                    f"⚠️ <b>Запись на {format_dt(booking[3], booking[4])} уже подтверждена.</b>\n\n"
-                    "Для отмены или переноса, пожалуйста, свяжитесь с мастером напрямую.",
-                    parse_mode="HTML"
-                )
-                return
+            # Check 24h rule
+            try:
+                booking_dt = datetime.strptime(f"{booking[3]} {booking[4]}", "%Y-%m-%d %H:%M")
+                booking_dt = MOSCOW_TZ.localize(booking_dt)
+                now = datetime.now(MOSCOW_TZ)
+                
+                if (booking_dt - now) < timedelta(hours=24):
+                    await query.edit_message_text(
+                        f"⚠️ <b>Отмена невозможна.</b>\n\n"
+                        f"До записи на {format_dt(booking[3], booking[4])} осталось менее 24 часов.\n"
+                        "Пожалуйста, свяжитесь с мастером напрямую для решения вопроса.",
+                        parse_mode="HTML"
+                    )
+                    return
+            except Exception as e:
+                logger.error(f"Error checking cancellation time: {e}")
 
             db_update_booking_status(b_id, "cancelled")
             await query.edit_message_text("✅ Запись успешно отменена.")
@@ -1224,28 +1228,66 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(MOSCOW_TZ)
-    tomorrow = (now + timedelta(days=1)).date().isoformat()
     
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM bookings WHERE date = ? AND status = 'confirmed' AND reminded = 0", (tomorrow,))
+    
+    # 1. Напоминание за 24 часа (строго)
+    # Ищем записи, до которых осталось от 23 до 25 часов
+    cursor.execute("""
+        SELECT * FROM bookings 
+        WHERE status = 'confirmed' AND reminded_24h = 0
+    """)
     bookings = cursor.fetchall()
     
     for b in bookings:
         try:
-            f_dt = format_dt(b[3], b[4])
-            text = (
-                "🔔 <b>Напоминание о записи завтра!</b>\n\n"
-                f"💅 Услуга: {b[2]}\n"
-                f"📅 Дата и время: {f_dt}\n"
-                f"🏠 Адрес: {ADDRESS_TEXT}\n"
-                f"🔗 <a href='{MAPS_URL}'>Открыть на картах</a>\n\n"
-                "До встречи! 💛"
-            )
-            await context.bot.send_message(chat_id=b[1], text=text, parse_mode="HTML")
-            cursor.execute("UPDATE bookings SET reminded = 1 WHERE id = ?", (b[0],))
+            b_dt = datetime.strptime(f"{b[3]} {b[4]}", "%Y-%m-%d %H:%M")
+            b_dt = MOSCOW_TZ.localize(b_dt)
+            diff = b_dt - now
+            
+            if timedelta(hours=23) <= diff <= timedelta(hours=25):
+                f_dt = format_dt(b[3], b[4])
+                text = (
+                    "🔔 <b>Напоминание: ваша запись завтра!</b>\n\n"
+                    f"💅 Услуга: {b[2]}\n"
+                    f"📅 Дата и время: {f_dt}\n"
+                    f"🏠 Адрес: {ADDRESS_TEXT}\n"
+                    f"🔗 <a href='{MAPS_URL}'>Открыть на картах</a>\n\n"
+                    "Ждем вас! 💛"
+                )
+                await context.bot.send_message(chat_id=b[1], text=text, parse_mode="HTML")
+                cursor.execute("UPDATE bookings SET reminded_24h = 1 WHERE id = ?", (b[0],))
         except Exception as e:
-            logger.error(f"Failed to send reminder to {b[1]}: {e}")
+            logger.error(f"24h reminder error: {e}")
+
+    # 2. Напоминание за 2 часа (строго)
+    # Ищем записи, до которых осталось от 1 до 3 часов
+    cursor.execute("""
+        SELECT * FROM bookings 
+        WHERE status = 'confirmed' AND reminded_2h = 0
+    """)
+    bookings = cursor.fetchall()
+    
+    for b in bookings:
+        try:
+            b_dt = datetime.strptime(f"{b[3]} {b[4]}", "%Y-%m-%d %H:%M")
+            b_dt = MOSCOW_TZ.localize(b_dt)
+            diff = b_dt - now
+            
+            if timedelta(minutes=110) <= diff <= timedelta(minutes=130):
+                f_dt = format_dt(b[3], b[4])
+                text = (
+                    "⏰ <b>Напоминание: запись через 2 часа!</b>\n\n"
+                    f"💅 Услуга: {b[2]}\n"
+                    f"📅 Время: {b[4]}\n"
+                    f"🏠 Адрес: {ADDRESS_TEXT}\n\n"
+                    "Скоро увидимся! ✨"
+                )
+                await context.bot.send_message(chat_id=b[1], text=text, parse_mode="HTML")
+                cursor.execute("UPDATE bookings SET reminded_2h = 1 WHERE id = ?", (b[0],))
+        except Exception as e:
+            logger.error(f"2h reminder error: {e}")
             
     conn.commit()
     conn.close()
@@ -1334,7 +1376,7 @@ def main():
     application.add_handler(MessageHandler(~filters.COMMAND, cleanup_all))
 
     job_queue = application.job_queue
-    job_queue.run_repeating(reminder_job, interval=600, first=10)
+    job_queue.run_repeating(reminder_job, interval=300, first=10)
 
     print("Bot started...")
     application.run_polling()
