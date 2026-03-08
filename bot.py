@@ -733,6 +733,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else:
                         await safe_send(update, context, "<b>📋 Ваши активные записи:</b>")
                         for b in bookings:
+                            # b[0] = id, b[1] = user_id, b[2] = service, b[3] = date, b[4] = time, b[5] = comment, b[6] = status
                             status_emoji = "⏳" if b[6] == "pending" else "✅"
                             f_dt = format_dt(b[3], b[4])
                             b_text = (
@@ -750,7 +751,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             await safe_send(update, context, b_text, reply_markup=kb)
                 except Exception as e:
                     logger.error(f"Error in my_bookings: {e}", exc_info=True)
-                    await safe_send(update, context, "❌ Произошла ошибка при получении записей. Попробуйте позже.")
+                    await safe_send(update, context, f"❌ Произошла ошибка при получении записей. Попробуйте позже. ({e})")
                 return
             elif norm == "reviews":
                 reviews = db_get_latest_reviews()
