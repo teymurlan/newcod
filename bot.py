@@ -346,10 +346,14 @@ def normalize_button(text: str) -> str:
     if not text: return None
     t = text.lower().strip()
     
+    # Логируем для отладки, если кнопки не срабатывают
+    logger.debug(f"Normalizing text: '{t}'")
+    
+    # Прямое сопоставление (самое надежное)
     if "записаться" in t: return "book"
     if "цены" in t: return "prices"
     if "обо мне" in t: return "about"
-    if "как нас найти" in t: return "location"
+    if "как нас найти" in t or "найти" in t: return "location"
     if "мои записи" in t: return "my_bookings"
     if "отзывы" in t: return "reviews"
     if "админ" in t: return "admin"
@@ -358,9 +362,24 @@ def normalize_button(text: str) -> str:
     if "меню" in t: return "menu"
     if "назад" in t: return "back"
     
+    # Дополнительная очистка от спецсимволов и эмодзи
+    clean = re.sub(r'[^\w\s]', '', t).strip()
+    if clean:
+        if "записаться" in clean: return "book"
+        if "цены" in clean: return "prices"
+        if "обо мне" in clean: return "about"
+        if "найти" in clean: return "location"
+        if "мои записи" in clean: return "my_bookings"
+        if "отзывы" in clean: return "reviews"
+        if "админ" in clean: return "admin"
+        if "вопросы" in clean or "ответы" in clean: return "faq"
+        if "рекомендация" in clean: return "recommendation"
+        if "меню" in clean: return "menu"
+        if "назад" in clean: return "back"
+    
     return None
 
-async def track_message(context: ContextTypes.DEFAULT_TYPE, message_id: int):
+async def track_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int):
     if not AUTO_CLEAN: return
     if "msg_history" not in context.user_data:
         context.user_data["msg_history"] = []
@@ -371,14 +390,14 @@ async def track_message(context: ContextTypes.DEFAULT_TYPE, message_id: int):
         context.user_data["msg_history"] = context.user_data["msg_history"][-6:]
         for mid in to_delete:
             try:
-                await context.bot.delete_message(chat_id=context._chat_id, message_id=mid)
+                await context.bot.delete_message(chat_id=chat_id, message_id=mid)
             except:
                 pass
 
 async def safe_send(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None, **kwargs):
     chat_id = update.effective_chat.id
     msg = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode="HTML", **kwargs)
-    await track_message(context, msg.message_id)
+    await track_message(context, chat_id, msg.message_id)
     return msg
 
 # --- PHOTO GALLERY ---
@@ -416,7 +435,7 @@ async def send_gallery(update: Update, context: ContextTypes.DEFAULT_TYPE, page:
                 caption="Мои работы:",
                 reply_markup=InlineKeyboardMarkup(kb)
             )
-            await track_message(context, msg.message_id)
+            await track_message(context, update.effective_chat.id, msg.message_id)
     except Exception as e:
         logger.error(f"Gallery error: {e}")
         await safe_send(update, context, "Ошибка при загрузке фото.")
@@ -586,7 +605,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(update, context, welcome_text, reply_markup=get_main_menu_keyboard(user_id))
     
     if update.message:
-        await track_message(context, update.message.message_id)
+        await track_message(context, update.effective_chat.id, update.message.message_id)
 
 async def on_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
@@ -606,7 +625,7 @@ async def on_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["mode"] = None
     
     await safe_send(update, context, f"✅ Регистрация завершена!\nПриятно познакомиться, {name}.\n\nНажмите 📅 <b>Записаться</b>, чтобы выбрать время.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
-    await track_message(context, update.message.message_id)
+    await track_message(context, update.effective_chat.id, update.message.message_id)
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
@@ -633,184 +652,177 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(update, context, "❌ Ошибка при сохранении фото. Попробуйте еще раз.")
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    user_id = update.effective_user.id
-    text = update.message.text
-    
-    # 0. Если это группа - удаляем всё, кроме команды /id
-    if chat.type != "private":
-        if not text.startswith('/id'):
+    try:
+        chat = update.effective_chat
+        user_id = update.effective_user.id
+        text = update.message.text
+        
+        if chat.type != "private":
+            if not text.startswith('/id'):
+                try: await update.message.delete()
+                except: pass
+            return
+
+        norm = normalize_button(text)
+        mode = context.user_data.get("mode")
+        
+        await track_message(context, chat.id, update.message.message_id)
+        
+        # 1. Если нажата кнопка меню
+        if norm:
+            context.user_data["mode"] = None
+            
+            if norm == "book":
+                user = db_get_user(user_id)
+                if not user:
+                    await safe_send(update, context, "Для записи нужно сначала представиться. Как мне к вам обращаться?")
+                    context.user_data["mode"] = "await_name"
+                    return
+                await safe_send(update, context, "Выберите услугу:", reply_markup=get_services_keyboard())
+                return
+            elif norm == "prices":
+                await prices_command(update, context)
+                return
+            elif norm == "about":
+                about_text = (
+                    "<b>✨ Искусство преображения ваших рук ✨</b>\n\n"
+                    "Привет! Я Ирина — топ-мастер с 7-летним стажем, который влюблен в свое дело. "
+                    "Моя миссия — не просто сделать маникюр, а подчеркнуть вашу индивидуальность и подарить уверенность в себе.\n\n"
+                    "<b>Почему выбирают меня:</b>\n"
+                    "💎 <b>Безопасность:</b> Стерилизация по медицинским стандартам (СанПиН). Крафт-пакет вскрываю только при вас.\n"
+                    "🎨 <b>Качество:</b> Работаю на премиум-материалах, которые носятся без сколов до 4-х недель.\n"
+                    "☕️ <b>Комфорт:</b> Уютная студия, любимые сериалы, ароматный кофе и время только для себя.\n\n"
+                    "<i>Ваши руки заслуживают лучшего ухода!</i>"
+                )
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📷 Фотогалерея", callback_data="show_gallery")],
+                    [InlineKeyboardButton("⬅️ Назад", callback_data="to_menu")]
+                ])
+                await safe_send(update, context, about_text, reply_markup=kb)
+                return
+            elif norm == "location":
+                loc_text = (
+                    "<b>📍 Как нас найти:</b>\n\n"
+                    f"🏠 Адрес: {ADDRESS_TEXT}\n"
+                    "Ориентир: 10 этаж, направо от лифта.\n\n"
+                    f"🔗 <a href='{MAPS_URL}'>Открыть на картах</a>"
+                )
+                kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="to_menu")]])
+                await safe_send(update, context, loc_text, reply_markup=kb)
+                return
+            elif norm == "my_bookings":
+                bookings = db_get_user_bookings(user_id)
+                if not bookings:
+                    await safe_send(update, context, "У вас пока нет активных записей.")
+                else:
+                    await safe_send(update, context, "<b>📋 Ваши активные записи:</b>")
+                    for b in bookings:
+                        status_emoji = "⏳" if b[6] == "pending" else "✅"
+                        f_dt = format_dt(b[3], b[4])
+                        b_text = (
+                            f"{status_emoji} <b>{b[2]}</b>\n"
+                            f"📅 {f_dt}\n"
+                            f"Статус: {'Ожидает подтверждения' if b[6] == 'pending' else 'Подтверждена'}\n"
+                        )
+                        kb = InlineKeyboardMarkup([
+                            [InlineKeyboardButton("❌ Отменить запись", callback_data=f"cancel_b_{b[0]}")],
+                            [
+                                InlineKeyboardButton("📱 SMS", url=f"sms:{MASTER_PHONE}"),
+                                InlineKeyboardButton("💬 Telegram", url=f"https://t.me/{MASTER_TG}")
+                            ]
+                        ])
+                        await safe_send(update, context, b_text, reply_markup=kb)
+                return
+            elif norm == "reviews":
+                reviews = db_get_latest_reviews()
+                text = "<b>⭐ Последние отзывы:</b>\n\n"
+                if not reviews:
+                    text += "Отзывов пока нет. Будьте первыми!"
+                else:
+                    for r in reviews:
+                        text += f"👤 {r[1]}:\n«{r[0]}»\n\n"
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✍️ Оставить отзыв", callback_data="add_review")],
+                    [InlineKeyboardButton("⬅️ Назад", callback_data="to_menu")]
+                ])
+                await safe_send(update, context, text, reply_markup=kb)
+                return
+            elif norm == "admin" and user_id == ADMIN_ID:
+                await show_admin_filters(update, context)
+                return
+            elif norm == "faq":
+                await faq_command(update, context)
+                return
+            elif norm == "menu":
+                await menu_command(update, context)
+                return
+            elif norm == "recommendation":
+                await recommendation_command(update, context)
+                return
+
+        # 2. Handle Input Modes
+        if mode == "await_name":
+            if len(text) > 40:
+                await safe_send(update, context, "Слишком длинное имя. Попробуйте еще раз:")
+                return
+            context.user_data["reg_name"] = text
+            context.user_data["mode"] = "await_phone"
+            kb = ReplyKeyboardMarkup([[KeyboardButton("📲 Отправить номер", request_contact=True)]], resize_keyboard=True)
+            await safe_send(update, context, f"Приятно познакомиться, {text}! Теперь введите ваш номер телефона или нажмите кнопку ниже:", reply_markup=kb)
+            return
+        
+        elif mode == "await_phone":
+            clean_phone = re.sub(r'[^\d+]', '', text)
+            if len(clean_phone) < 10 or len(clean_phone) > 13:
+                await safe_send(update, context, "❌ Неверный формат номера. Попробуйте еще раз (например, +79991234567):")
+                return
+            
+            name = context.user_data.get("reg_name", update.effective_user.first_name)
+            username = update.effective_user.username
+            db_save_user(user_id, name, clean_phone, username)
+            context.user_data["mode"] = None
+            await safe_send(update, context, f"✅ Регистрация завершена!\nПриятно познакомиться, {name}.", reply_markup=get_main_menu_keyboard(user_id))
+            
+            admin_msg = (
+                f"👤 <b>Новый пользователь зарегистрирован!</b>\n\n"
+                f"Имя: {name}\n"
+                f"Телефон: {clean_phone}\n"
+                f"Username: @{username if username else 'отсутствует'}\n"
+            )
+            await send_notification(context, admin_msg)
+            return
+
+        elif mode == "await_comment":
+            context.user_data["b_comment"] = text
+            context.user_data["mode"] = None
+            await show_booking_summary(update, context)
+            return
+
+        elif mode == "await_review":
+            db_save_review(user_id, text)
+            context.user_data["mode"] = None
+            await safe_send(update, context, "🙏 Спасибо за ваш отзыв! Он появится в списке после обновления.")
+            return
+
+        elif mode == "admin_msg":
+            target_user_id = context.user_data.get("admin_target_user")
+            if target_user_id:
+                try:
+                    await context.bot.send_message(chat_id=target_user_id, text=f"💬 <b>Сообщение от мастера:</b>\n\n{text}", parse_mode="HTML")
+                    await safe_send(update, context, "✅ Сообщение отправлено клиенту.")
+                except:
+                    await safe_send(update, context, "❌ Не удалось отправить сообщение.")
+            context.user_data["mode"] = None
+            return
+
+        # 3. Анти-спам
+        if not norm and not mode:
             try: await update.message.delete()
             except: pass
-        return
 
-    norm = normalize_button(text)
-    mode = context.user_data.get("mode")
-    
-    await track_message(context, update.message.message_id)
-    
-    # 1. Если нажата кнопка меню - ВСЕГДА сбрасываем режим и выполняем команду
-    if norm:
-        context.user_data["mode"] = None
-        # ... (rest of the logic remains same)
-        
-        if norm == "book":
-            user = db_get_user(user_id)
-            if not user:
-                await safe_send(update, context, "Для записи нужно сначала представиться. Как мне к вам обращаться?")
-                context.user_data["mode"] = "await_name"
-                return
-            await safe_send(update, context, "Выберите услугу:", reply_markup=get_services_keyboard())
-            return
-        elif norm == "prices":
-            await prices_command(update, context)
-            return
-        elif norm == "about":
-            about_text = (
-                "<b>✨ Искусство преображения ваших рук ✨</b>\n\n"
-                "Привет! Я Ирина — топ-мастер с 7-летним стажем, который влюблен в свое дело. "
-                "Моя миссия — не просто сделать маникюр, а подчеркнуть вашу индивидуальность и подарить уверенность в себе.\n\n"
-                "<b>Почему выбирают меня:</b>\n"
-                "💎 <b>Безопасность:</b> Стерилизация по медицинским стандартам (СанПиН). Крафт-пакет вскрываю только при вас.\n"
-                "🎨 <b>Качество:</b> Работаю на премиум-материалах, которые носятся без сколов до 4-х недель.\n"
-                "☕️ <b>Комфорт:</b> Уютная студия, любимые сериалы, ароматный кофе и время только для себя.\n\n"
-                "<i>Ваши руки заслуживают лучшего ухода!</i>"
-            )
-            # Добавляем логирование для отладки
-            logger.info(f"User {user_id} requested 'About' section")
-            
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📷 Фотогалерея", callback_data="show_gallery")],
-                [InlineKeyboardButton("⬅️ Назад", callback_data="to_menu")]
-            ])
-            await safe_send(update, context, about_text, reply_markup=kb)
-            return
-        elif norm == "location":
-            loc_text = (
-                "<b>📍 Как нас найти:</b>\n\n"
-                f"🏠 Адрес: {ADDRESS_TEXT}\n"
-                "Ориентир: 10 этаж, направо от лифта.\n\n"
-                f"🔗 <a href='{MAPS_URL}'>Открыть на картах</a>"
-            )
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="to_menu")]])
-            await safe_send(update, context, loc_text, reply_markup=kb)
-            return
-        elif norm == "my_bookings":
-            bookings = db_get_user_bookings(user_id)
-            if not bookings:
-                await safe_send(update, context, "У вас пока нет активных записей.")
-            else:
-                await safe_send(update, context, "<b>📋 Ваши активные записи:</b>", parse_mode="HTML")
-                for b in bookings:
-                    status_emoji = "⏳" if b[6] == "pending" else "✅"
-                    f_dt = format_dt(b[3], b[4])
-                    b_text = (
-                        f"{status_emoji} <b>{b[2]}</b>\n"
-                        f"📅 {f_dt}\n"
-                        f"Статус: {'Ожидает подтверждения' if b[6] == 'pending' else 'Подтверждена'}\n"
-                    )
-                    kb = InlineKeyboardMarkup([
-                        [InlineKeyboardButton("❌ Отменить запись", callback_data=f"cancel_b_{b[0]}")],
-                        [
-                            InlineKeyboardButton("📱 SMS", url=f"sms:{MASTER_PHONE}"),
-                            InlineKeyboardButton("💬 Telegram", url=f"https://t.me/{MASTER_TG}")
-                        ]
-                    ])
-                    await safe_send(update, context, b_text, reply_markup=kb)
-            return
-        elif norm == "reviews":
-            reviews = db_get_latest_reviews()
-            text = "<b>⭐ Последние отзывы:</b>\n\n"
-            if not reviews:
-                text += "Отзывов пока нет. Будьте первыми!"
-            else:
-                for r in reviews:
-                    text += f"👤 {r[1]}:\n«{r[0]}»\n\n"
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✍️ Оставить отзыв", callback_data="add_review")],
-                [InlineKeyboardButton("⬅️ Назад", callback_data="to_menu")]
-            ])
-            await safe_send(update, context, text, reply_markup=kb)
-            return
-        elif norm == "admin" and user_id == ADMIN_ID:
-            await show_admin_filters(update, context)
-            return
-            
-        elif norm == "faq":
-            await faq_command(update, context)
-            return
-            
-        elif norm == "menu":
-            await menu_command(update, context)
-            return
-        elif norm == "recommendation":
-            await recommendation_command(update, context)
-            return
-
-    # 2. Handle Input Modes
-    mode = context.user_data.get("mode")
-    if mode == "await_name":
-        if len(text) > 40:
-            await safe_send(update, context, "Слишком длинное имя. Попробуйте еще раз:")
-            return
-        context.user_data["reg_name"] = text
-        context.user_data["mode"] = "await_phone"
-        kb = ReplyKeyboardMarkup([[KeyboardButton("📲 Отправить номер", request_contact=True)]], resize_keyboard=True)
-        await safe_send(update, context, f"Приятно познакомиться, {text}! Теперь введите ваш номер телефона или нажмите кнопку ниже:", reply_markup=kb)
-        return
-    
-    elif mode == "await_phone":
-        clean_phone = re.sub(r'[^\d+]', '', text)
-        if len(clean_phone) < 10 or len(clean_phone) > 13:
-            await safe_send(update, context, "❌ Неверный формат номера. Попробуйте еще раз (например, +79991234567):")
-            return
-        
-        name = context.user_data.get("reg_name", update.effective_user.first_name)
-        username = update.effective_user.username
-        db_save_user(user_id, name, clean_phone, username)
-        context.user_data["mode"] = None
-        await safe_send(update, context, f"✅ Регистрация завершена!\nПриятно познакомиться, {name}.", reply_markup=get_main_menu_keyboard(user_id))
-        
-        # Уведомление админу о новом пользователе
-        admin_msg = (
-            f"👤 <b>Новый пользователь зарегистрирован!</b>\n\n"
-            f"Имя: {name}\n"
-            f"Телефон: {clean_phone}\n"
-            f"Username: @{username if username else 'отсутствует'}\n"
-        )
-        if username:
-            admin_msg += f"🔗 <a href='https://t.me/{username}'>Открыть чат</a>"
-        else:
-            admin_msg += f"🔗 <a href='tg://user?id={user_id}'>Открыть профиль</a>"
-            
-        await send_notification(context, admin_msg)
-        return
-
-    elif mode == "await_comment":
-        context.user_data["b_comment"] = text
-        context.user_data["mode"] = None
-        await show_booking_summary(update, context)
-
-    elif mode == "await_review":
-        db_save_review(user_id, text)
-        context.user_data["mode"] = None
-        await safe_send(update, context, "🙏 Спасибо за ваш отзыв! Он появится в списке после обновления.")
-
-    elif mode == "admin_msg":
-        target_user_id = context.user_data.get("admin_target_user")
-        if target_user_id:
-            try:
-                await context.bot.send_message(chat_id=target_user_id, text=f"💬 <b>Сообщение от мастера:</b>\n\n{text}", parse_mode="HTML")
-                await safe_send(update, context, "✅ Сообщение отправлено клиенту.")
-            except:
-                await safe_send(update, context, "❌ Не удалось отправить сообщение.")
-        context.user_data["mode"] = None
-        return
-
-    # 3. Если нет режима и это не кнопка - УДАЛЯЕМ (Анти-спам)
-    if not norm and not mode:
-        try: await update.message.delete()
-        except: pass
+    except Exception as e:
+        logger.error(f"Error in on_text: {e}", exc_info=True)
+        # Опционально: отправить сообщение админу об ошибке
 
 async def recommendation_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
