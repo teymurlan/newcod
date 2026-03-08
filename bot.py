@@ -95,7 +95,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- DATABASE ---
-DB_PATH = "bot.db"
+DB_PATH = os.getenv("DB_PATH", "bot.db")
 
 def db_init():
     conn = sqlite3.connect(DB_PATH)
@@ -1173,34 +1173,48 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(update, context, "Введите сообщение клиенту:")
 
     elif data.startswith("cancel_b_"):
-        b_id = int(data.split("_")[2])
-        booking = db_get_booking(b_id)
-        if not booking:
-            await query.answer("Запись не найдена.", show_alert=True)
-            return
-            
-        if booking[6] == "cancelled":
-            await query.answer("Запись уже отменена.", show_alert=True)
-            return
-            
-        if booking[6] == "confirmed":
-            await query.answer("Запись уже подтверждена мастером. Для отмены свяжитесь с мастером напрямую.", show_alert=True)
-            return
+        try:
+            b_id = int(data.split("_")[2])
+            booking = db_get_booking(b_id)
+            if not booking:
+                await query.edit_message_text("❌ Запись не найдена.")
+                return
+                
+            if booking[1] != user_id:
+                await query.edit_message_text("❌ Это не ваша запись.")
+                return
 
-        db_update_booking_status(b_id, "cancelled")
-        await query.edit_message_text("❌ Запись отменена.")
-        user = db_get_user(user_id)
-        f_dt = format_dt(booking[3], booking[4])
-        
-        user_link = f"@{user[3]}" if user[3] else f"<a href='tg://user?id={user_id}'>{user[1]}</a>"
-        
-        admin_cancel_msg = (
-            f"⚠️ <b>Клиент отменил запись!</b>\n\n"
-            f"👤 Клиент: {user[1]} ({user[2]}) {user_link}\n"
-            f"💅 Услуга: {booking[2]}\n"
-            f"📅 Дата: {f_dt}"
-        )
-        await send_notification(context, admin_cancel_msg)
+            if booking[6] == "cancelled":
+                await query.edit_message_text("❌ Запись уже отменена.")
+                return
+                
+            if booking[6] == "confirmed":
+                # Для подтвержденных записей просто выводим сообщение, не отменяя
+                await query.edit_message_text(
+                    f"⚠️ <b>Запись на {format_dt(booking[3], booking[4])} уже подтверждена.</b>\n\n"
+                    "Для отмены или переноса, пожалуйста, свяжитесь с мастером напрямую.",
+                    parse_mode="HTML"
+                )
+                return
+
+            db_update_booking_status(b_id, "cancelled")
+            await query.edit_message_text("✅ Запись успешно отменена.")
+            
+            user = db_get_user(user_id)
+            f_dt = format_dt(booking[3], booking[4])
+            
+            user_link = f"@{user[3]}" if user[3] else f"<a href='tg://user?id={user_id}'>{user[1]}</a>"
+            
+            admin_cancel_msg = (
+                f"⚠️ <b>Клиент отменил запись!</b>\n\n"
+                f"👤 Клиент: {user[1]} ({user[2]}) {user_link}\n"
+                f"💅 Услуга: {booking[2]}\n"
+                f"📅 Дата: {f_dt}"
+            )
+            await send_notification(context, admin_cancel_msg)
+        except Exception as e:
+            logger.error(f"Error in cancel_b: {e}")
+            await query.edit_message_text("❌ Произошла ошибка при отмене записи.")
 
     elif data == "add_review":
         context.user_data["mode"] = "await_review"
